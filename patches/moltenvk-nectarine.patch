@@ -1,0 +1,1429 @@
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm
+index 2a7eff4..18c339e 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDispatch.mm
+@@ -43,10 +43,16 @@
+ }
+ 
+ void MVKCmdDispatch::encode(MVKCommandEncoder* cmdEncoder) {
++	{ extern uint32_t gMVKDiagDispatchCount; gMVKDiagDispatchCount++; }	// MVKDIAG
+ 	MTLRegion mtlThreadgroupCount = MTLRegionMake3D(_baseGroupX, _baseGroupY, _baseGroupZ, _groupCountX, _groupCountY, _groupCountZ);
+ 	cmdEncoder->finalizeDispatchState();	// Ensure all updated state has been submitted to Metal
+ 	id<MTLComputeCommandEncoder> mtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch);
+ 	auto* pipeline = cmdEncoder->getComputePipeline();
++	{	// MVKDIAG
++		extern uint64_t mvkDiagGetCompHash(const void*);
++		extern uint64_t gMVKDiagLastCompHash;
++		gMVKDiagLastCompHash = mvkDiagGetCompHash(pipeline);
++	}
+ 	if (pipeline->allowsDispatchBase()) {
+ 		// We'll use the stage-input region to pass the base along to the shader.
+ 		// Hopefully Metal won't complain that we didn't set up a stage-input descriptor.
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index 664276b..e9ba675 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -24,6 +24,24 @@
+ #include "MVKFoundation.h"
+ #include "mvk_datatypes.hpp"
+ 
++// MVKX: count render-pass restarts by call site. Each restart costs a full attachment
++// store+reload on tile GPUs, and the trace put them at 13% of total GPU time.
++#include <map>
++static void mvkxRestart(int line) {
++    if (!getenv("MVK_X_PASSSTATS")) { return; }
++    static std::map<int,unsigned long> counts;
++    static time_t last = 0;
++    counts[line]++;
++    time_t now = time(NULL);
++    if (!last) { last = now; return; }
++    if (now - last < 5) { return; }
++    fprintf(stderr, "[mvk-restarts] per 5s:");
++    for (auto& kv : counts) { fprintf(stderr, " line%d=%lu", kv.first, kv.second); }
++    fprintf(stderr, "\n");
++    counts.clear();
++    last = now;
++}
++
+ 
+ #pragma mark -
+ #pragma mark MVKCmdBindVertexBuffers
+@@ -170,6 +188,7 @@
+ }
+ 
+ void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
++	{ extern uint32_t gMVKDiagDrawCount; gMVKDiagDrawCount++; }	// MVKDIAG
+ 
+ 	if (_vertexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
+ 
+@@ -290,7 +309,7 @@
+ 				}
+                 // Running this stage prematurely ended the render pass, so we have to start it up again.
+                 // TODO: On iOS, maybe we could use a tile shader to avoid this.
+-                cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
++                mvkxRestart(__LINE__); cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+                 break;
+ 			}
+             case kMVKGraphicsStageRasterization:
+@@ -437,12 +456,13 @@
+     }
+ 
+     // Running this stage prematurely ended the render pass, so we have to start it up again.
+-    cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
++    mvkxRestart(__LINE__); cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+ 
+     return uint16Buf;
+ }
+ 
+ void MVKCmdDrawIndexed::encode(MVKCommandEncoder* cmdEncoder) {
++	{ extern uint32_t gMVKDiagDrawCount; gMVKDiagDrawCount++; }	// MVKDIAG
+ 
+ 	if (_indexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
+ 
+@@ -576,7 +596,7 @@
+ 				}
+                 // Running this stage prematurely ended the render pass, so we have to start it up again.
+                 // TODO: On iOS, maybe we could use a tile shader to avoid this.
+-                cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
++                mvkxRestart(__LINE__); cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+                 break;
+ 			}
+             case kMVKGraphicsStageRasterization:
+@@ -707,7 +727,7 @@
+ 						  threadsPerThreadgroup: MTLSizeMake(mtlConvertState.threadExecutionWidth, 1, 1)];
+ 	}
+ 	// Switch back to rendering now.
+-	cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
++	mvkxRestart(__LINE__); cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+ 
+ 	MVKCmdDrawIndexedIndirect diiCmd;
+ 	diiCmd.setContent(cmdEncoder->_cmdBuffer,
+@@ -865,7 +885,7 @@
+                                       threadsPerThreadgroup: MTLSizeMake(mtlConvertState.threadExecutionWidth, 1, 1)];
+                 }
+                 // Switch back to rendering now, since we don't have compute stages to run anyway.
+-                cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
++                mvkxRestart(__LINE__); cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+             }
+ 
+             cmdEncoder->finalizeDrawState(stage);	// Ensure all updated state has been submitted to Metal
+@@ -925,7 +945,7 @@
+                     mtlIndBuffOfst += sizeof(MTLDispatchThreadgroupsIndirectArguments);
+                     // Running this stage prematurely ended the render pass, so we have to start it up again.
+                     // TODO: On iOS, maybe we could use a tile shader to avoid this.
+-                    cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
++                    mvkxRestart(__LINE__); cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+                     break;
+                 case kMVKGraphicsStageRasterization:
+                     if (pipeline->isTessellationPipeline()) {
+@@ -1208,7 +1228,7 @@
+ 									  threadsPerThreadgroup: MTLSizeMake(mtlConvertState.threadExecutionWidth, 1, 1)];
+ 				}
+ 				// Switch back to rendering now, since we don't have compute stages to run anyway.
+-                cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
++                mvkxRestart(__LINE__); cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+             }
+ 
+ 	        cmdEncoder->finalizeDrawState(stage);	// Ensure all updated state has been submitted to Metal
+@@ -1273,7 +1293,7 @@
+                     mtlTempIndBuffOfst += sizeof(MTLDispatchThreadgroupsIndirectArguments);
+                     // Running this stage prematurely ended the render pass, so we have to start it up again.
+                     // TODO: On iOS, maybe we could use a tile shader to avoid this.
+-                    cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
++                    mvkxRestart(__LINE__); cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
+                     break;
+                 case kMVKGraphicsStageRasterization:
+                     if (pipeline->isTessellationPipeline()) {
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
+index ab318c5..da9e81d 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdTransfer.mm
+@@ -134,6 +134,18 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+ 
+ template <size_t N>
+ void MVKCmdCopyImage<N>::encode(MVKCommandEncoder* cmdEncoder, MVKCommandUse commandUse) {
++	{	// MVKDIAG: blits and copies are the one path the pass/dispatch dumps cannot see.
++		extern bool mvkDiagDelayElapsedExt();
++		if (getenv("MVK_DIAG_DUMP_XFER") && mvkDiagDelayElapsedExt()) {
++			id<MTLTexture> st = _srcImage ? _srcImage->getMTLTexture(0) : nil;
++			id<MTLTexture> dt = _dstImage ? _dstImage->getMTLTexture(0) : nil;
++			fprintf(stderr, "[mvk-diag] %s: src=%p %lux%lu fmt=%lu -> dst=%p %lux%lu fmt=%lu\n", "copyImage",
++					(void*)st, (unsigned long)(st ? st.width : 0), (unsigned long)(st ? st.height : 0),
++					(unsigned long)(st ? st.pixelFormat : 0),
++					(void*)dt, (unsigned long)(dt ? dt.width : 0), (unsigned long)(dt ? dt.height : 0),
++					(unsigned long)(dt ? dt.pixelFormat : 0));
++		}
++	}
+     MVKPixelFormats* pixFmts = cmdEncoder->getPixelFormats();
+     uint32_t copyCnt = (uint32_t)_vkImageCopies.size();
+     VkBufferImageCopy vkSrcCopies[copyCnt];
+@@ -480,6 +492,18 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+ 
+ template <size_t N>
+ void MVKCmdBlitImage<N>::encode(MVKCommandEncoder* cmdEncoder, MVKCommandUse commandUse) {
++	{	// MVKDIAG: blits and copies are the one path the pass/dispatch dumps cannot see.
++		extern bool mvkDiagDelayElapsedExt();
++		if (getenv("MVK_DIAG_DUMP_XFER") && mvkDiagDelayElapsedExt()) {
++			id<MTLTexture> st = _srcImage ? _srcImage->getMTLTexture(0) : nil;
++			id<MTLTexture> dt = _dstImage ? _dstImage->getMTLTexture(0) : nil;
++			fprintf(stderr, "[mvk-diag] %s: src=%p %lux%lu fmt=%lu -> dst=%p %lux%lu fmt=%lu\n", "blitImage",
++					(void*)st, (unsigned long)(st ? st.width : 0), (unsigned long)(st ? st.height : 0),
++					(unsigned long)(st ? st.pixelFormat : 0),
++					(void*)dt, (unsigned long)(dt ? dt.width : 0), (unsigned long)(dt ? dt.height : 0),
++					(unsigned long)(dt ? dt.pixelFormat : 0));
++		}
++	}
+ 
+ 	auto& mtlFeats = cmdEncoder->getMetalFeatures();
+ 	size_t vkIBCnt = _vkImageBlits.size();
+@@ -806,6 +830,18 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+ 
+ template <size_t N>
+ void MVKCmdResolveImage<N>::encode(MVKCommandEncoder* cmdEncoder) {
++	{	// MVKDIAG: blits and copies are the one path the pass/dispatch dumps cannot see.
++		extern bool mvkDiagDelayElapsedExt();
++		if (getenv("MVK_DIAG_DUMP_XFER") && mvkDiagDelayElapsedExt()) {
++			id<MTLTexture> st = _srcImage ? _srcImage->getMTLTexture(0) : nil;
++			id<MTLTexture> dt = _dstImage ? _dstImage->getMTLTexture(0) : nil;
++			fprintf(stderr, "[mvk-diag] %s: src=%p %lux%lu fmt=%lu -> dst=%p %lux%lu fmt=%lu\n", "resolveImage",
++					(void*)st, (unsigned long)(st ? st.width : 0), (unsigned long)(st ? st.height : 0),
++					(unsigned long)(st ? st.pixelFormat : 0),
++					(void*)dt, (unsigned long)(dt ? dt.width : 0), (unsigned long)(dt ? dt.height : 0),
++					(unsigned long)(dt ? dt.pixelFormat : 0));
++		}
++	}
+ 
+ 	auto& mtlFeats = cmdEncoder->getMetalFeatures();
+ 	size_t vkIRCnt = _vkImageResolves.size();
+@@ -1532,6 +1568,16 @@ static inline MTLPixelFormat getDepthStencilAspectFormat(const MTLPixelFormat fo
+ 
+ template <size_t N>
+ void MVKCmdClearImage<N>::encode(MVKCommandEncoder* cmdEncoder) {
++	{	// MVKDIAG: clears were the last untracked writer of an image.
++		extern bool mvkDiagDelayElapsedExt();
++		if (getenv("MVK_DIAG_DUMP_XFER") && mvkDiagDelayElapsedExt()) {
++			id<MTLTexture> t = _image ? _image->getMTLTexture(0) : nil;
++			if (t) {
++				fprintf(stderr, "[mvk-diag] clearImage: %p %lux%lu fmt=%lu\n", (void*)t,
++						(unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat);
++			}
++		}
++	}
+ 	bool isDS = isDepthStencilClear();
+ 	NSString* mtlRendEncName = (isDS
+ 								? mvkMTLRenderCommandEncoderLabel(kMVKCommandUseClearDepthStencilImage)
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+index 76ca788..40ef5b4 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+@@ -489,6 +489,9 @@ public:
+ 
+ 	/** The current Metal command buffer. */
+ 	id<MTLCommandBuffer> _mtlCmdBuffer;
++	id<MTLTexture> _diagPassColorTex = nil;	// MVKDIAG
++	id<MTLTexture> _diagPassColorTexAll[8] = {};	// MVKDIAG: all colour attachments, not just 0
++	id<MTLTexture> _diagPassDepthTex = nil;	// MVKDIAG: depth drives deferred position reconstruction
+ 
+ 	/** The current Metal render encoder. */
+ 	id<MTLRenderCommandEncoder> _mtlRenderEncoder;
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index 8c24deb..ac09284 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -800,6 +800,28 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ 	VkExtent2D raFullExtent = { _renderArea.offset.x + _renderArea.extent.width, _renderArea.offset.y + _renderArea.extent.height };
+     mtlRPDesc.renderTargetWidth = max(min(raFullExtent.width, (fbExtent.width ? fbExtent.width : raFullExtent.width)), 1u);
+     mtlRPDesc.renderTargetHeight = max(min(raFullExtent.height, (fbExtent.height ? fbExtent.height : raFullExtent.height)), 1u);
++	_diagPassColorTex = mtlRPDesc.colorAttachments[0].texture;	// MVKDIAG
++	for (uint32_t ai = 0; ai < 8; ai++) { _diagPassColorTexAll[ai] = mtlRPDesc.colorAttachments[ai].texture; }	// MVKDIAG
++	_diagPassDepthTex = mtlRPDesc.depthAttachment.texture;	// MVKDIAG
++	{	// MVKDIAG: attachment 0 is not the whole story -- report every colour attachment that is
++		// a scene-sized float target, so a pass writing one at index 1..7 cannot hide.
++		extern bool mvkDiagDelayElapsedExt();
++		static uint32_t attLogged = 0;
++		if (getenv("MVK_DIAG_ATTACH") && attLogged < 400 && mvkDiagDelayElapsedExt()) {
++			for (uint32_t ai = 0; ai < 8; ai++) {
++				id<MTLTexture> at = mtlRPDesc.colorAttachments[ai].texture;
++				if (!at) { continue; }
++				if (at.pixelFormat == MTLPixelFormatRGBA16Float && at.width >= 512) {
++					attLogged++;
++					fprintf(stderr, "[mvk-diag] ATTACH[%u] %p %lux%lu fmt=%lu load=%lu store=%lu\n",
++							ai, (void*)at, (unsigned long)at.width, (unsigned long)at.height,
++							(unsigned long)at.pixelFormat,
++							(unsigned long)mtlRPDesc.colorAttachments[ai].loadAction,
++							(unsigned long)mtlRPDesc.colorAttachments[ai].storeAction);
++				}
++			}
++		}
++	}
+     if (_canUseLayeredRendering) {
+         uint32_t renderTargetArrayLength;
+         bool found3D = false, found2D = false;
+@@ -838,6 +860,20 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+     _mtlRenderEncoder = [_mtlCmdBuffer renderCommandEncoderWithDescriptor: mtlRPDesc];
+ 	retainIfImmediatelyEncoding(_mtlRenderEncoder);
+ 	_cmdBuffer->setMetalObjectLabel(_mtlRenderEncoder, getMTLRenderCommandEncoderName(cmdUse));
++
++	// MVKX: DXVK supplies no debug names, so the label above is nil and Instruments shows
++	// every encoder unlabelled -- a GPU trace then cannot say WHICH pass is expensive.
++	// Name it after its attachment so the timeline is actually attributable.
++	if (getenv("MVK_X_LABEL_ENCODERS")) {
++		id<MTLTexture> mvkxTex = mtlRPDesc.colorAttachments[0].texture;
++		const char* mvkxKind = "color";
++		if ( !mvkxTex ) { mvkxTex = mtlRPDesc.depthAttachment.texture; mvkxKind = "depth"; }
++		if (mvkxTex) {
++			[_mtlRenderEncoder setLabel: [NSString stringWithFormat: @"RP %s %lux%lu fmt%lu",
++				mvkxKind, (unsigned long)mvkxTex.width, (unsigned long)mvkxTex.height,
++				(unsigned long)mvkxTex.pixelFormat]];
++		}
++	}
+ 	getState().beginGraphicsEncoding(getSampleCount());
+ 
+ 	encodeBarrierWaits(cmdUse);
+@@ -1026,6 +1062,308 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ 	endRenderpass();
+ }
+ 
++
++// MVKDIAG: dump each render pass's first colour attachment, so the frame can be followed pass by
++// pass to see where the image is lost. Set MVK_DIAG_DUMP_PASSES=<n> to capture n passes once.
++uint32_t gMVKDiagDrawCount = 0;	// MVKDIAG
++uint32_t gMVKDiagDispatchCount = 0;	// MVKDIAG
++uint64_t gMVKDiagLastFragHash = 0;	// MVKDIAG
++struct MVKDiagTexSlot { id<MTLTexture> tex; uint64_t fragHash; };	// MVKDIAG
++
++bool mvkDiagDelayElapsedExt();	// MVKDIAG
++static bool mvkDiagDelayElapsed() {	// MVKDIAG
++	static time_t startTime = 0;
++	static time_t afterSecs = 0;
++	if (!startTime) {
++		startTime = time(NULL);
++		const char* delay = getenv("MVK_DIAG_PASS_AFTER");
++		afterSecs = delay ? atoi(delay) : 0;
++	}
++	return (time(NULL) - startTime) >= afterSecs;
++}
++
++bool mvkDiagDelayElapsedExt() { return mvkDiagDelayElapsed(); }	// MVKDIAG
++
++
++static NSUInteger mvkDiagBytesPerPixel(MTLPixelFormat fmt) {	// MVKDIAG
++	switch (fmt) {
++		case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Uint:
++		case MTLPixelFormatR8Snorm: case MTLPixelFormatR8Sint:
++			return 1;
++		case MTLPixelFormatR16Float: case MTLPixelFormatR16Unorm:
++		case MTLPixelFormatR16Uint:  case MTLPixelFormatR16Sint:
++			return 2;
++		case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
++		case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
++		case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatBGR10A2Unorm:
++		case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB9E5Float:
++		case MTLPixelFormatRG16Float: case MTLPixelFormatRG16Unorm:
++		case MTLPixelFormatR32Float: case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint:
++			return 4;
++		case MTLPixelFormatRGBA16Float: case MTLPixelFormatRGBA16Unorm:
++		case MTLPixelFormatRGBA16Snorm: case MTLPixelFormatRGBA16Uint:
++		case MTLPixelFormatRGBA16Sint:
++		case MTLPixelFormatRG32Float:
++			return 8;
++		case MTLPixelFormatDepth32Float: return 4;	// MVKDIAG
++		case MTLPixelFormatDepth32Float_Stencil8: return 4;	// MVKDIAG (depth aspect only)
++		case MTLPixelFormatRGBA32Float: case MTLPixelFormatRGBA32Uint:
++		case MTLPixelFormatRGBA32Sint:
++			return 16;
++		default:
++			return 0;	// compressed or unhandled -- not dumpable
++	}
++}
++
++static float mvkDiagHalfToFloat(uint16_t hv) {	// MVKDIAG
++	int exp = (hv >> 10) & 0x1F; int man = hv & 0x3FF; int sgn = hv >> 15;
++	float v = (exp == 0) ? man / 16384.0f : ldexpf(1.0f + man / 1024.0f, exp - 15);
++	return sgn ? -v : v;
++}
++
++// kind 0 = ordinary render pass, 1 = a texture a shader was handed (own budget so it is never
++// starved by the pass dumps), 2 = a compute-written storage image.
++static void mvkDiagDumpPassTexture(id<MTLTexture> tex, id<MTLCommandBuffer> mtlCmdBuff, uint32_t drawCount, uint64_t fragHash, int kind = 0) {
++	static int32_t budgets[3] = {-1, -1, -1};
++	static int32_t idx = 0;
++	static time_t startTime = 0;
++	static time_t afterSecs = 0;
++	if (budgets[0] < 0) {
++		const char* env = getenv("MVK_DIAG_DUMP_PASSES");
++		budgets[0] = env ? atoi(env) : 0;
++		const char* envT = getenv("MVK_DIAG_DUMP_TEX0");
++		budgets[1] = envT ? atoi(envT) : 8;
++		const char* envC = getenv("MVK_DIAG_DUMP_COMPUTE_N");
++		budgets[2] = envC ? atoi(envC) : 40;
++		const char* delay = getenv("MVK_DIAG_PASS_AFTER");
++		afterSecs = delay ? atoi(delay) : 0;
++		startTime = time(NULL);
++	}
++	int32_t& budget = budgets[kind];
++	if (!tex || !mtlCmdBuff) { return; }
++	if (afterSecs && (time(NULL) - startTime) < afterSecs) { return; }
++	static int32_t logIdx = 0;
++	int myLogIdx = logIdx++;
++	fprintf(stderr, "[mvk-diag] %s %d: %lux%lu fmt=%lu type=%lu usage=%lu draws=%u dispatchesSinceLastPass=%u fs=%016llx\n",
++			(kind == 1) ? "tex0" : (kind == 2) ? "cmpw" : "pass", myLogIdx,
++			(unsigned long)tex.width, (unsigned long)tex.height, (unsigned long)tex.pixelFormat,
++			(unsigned long)tex.textureType, (unsigned long)tex.usage,
++			drawCount, gMVKDiagDispatchCount, (unsigned long long)fragHash);
++	if (budget <= 0) { return; }
++	// Dump slice 0 of an array rather than skipping it: several UE5 scene targets are 2D arrays,
++	// and silently skipping them leaves exactly the kind of blind spot this is meant to close.
++	if (tex.textureType != MTLTextureType2D && tex.textureType != MTLTextureType2DArray &&
++		tex.textureType != MTLTextureTypeTextureBuffer) { return; }
++	if (tex.storageMode == MTLStorageModeMemoryless) {
++		fprintf(stderr, "[mvk-diag] pass (memoryless, not dumpable): %lux%lu fmt=%lu\n",
++				(unsigned long)tex.width, (unsigned long)tex.height, (unsigned long)tex.pixelFormat);
++		return;
++	}
++	NSUInteger w = tex.width, h = tex.height;
++	// MVKDIAG: texture buffers (h==1) are how MoltenVK emulates Vulkan texel buffers, and UE5's
++	// forward light grid is one. Report how much of it is non-zero instead of writing a PPM --
++	// an empty light grid means every mesh shades unlit, which looks like "missing lighting".
++	if (h == 1 && w >= 1024) {
++		NSUInteger bppTB = mvkDiagBytesPerPixel(tex.pixelFormat);
++		if (!bppTB) { return; }
++		NSUInteger nBytes = MIN((NSUInteger)(w * bppTB), (NSUInteger)(1u << 20));
++		id<MTLBuffer> tb = [mtlCmdBuff.device newBufferWithLength: nBytes options: MTLResourceStorageModeShared];
++		if (!tb) { return; }
++		id<MTLBlitCommandEncoder> tblit = [mtlCmdBuff blitCommandEncoder];
++		[tblit copyFromTexture: tex sourceSlice: 0 sourceLevel: 0
++				 sourceOrigin: MTLOriginMake(0, 0, 0) sourceSize: MTLSizeMake(nBytes / bppTB, 1, 1)
++					 toBuffer: tb destinationOffset: 0
++		   destinationBytesPerRow: nBytes destinationBytesPerImage: nBytes];
++		[tblit endEncoding];
++		NSUInteger wCap = w;
++		MTLPixelFormat fmtTB = tex.pixelFormat;
++		[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mcb) {
++			const uint8_t* p8 = (const uint8_t*)tb.contents;
++			NSUInteger nz = 0;
++			for (NSUInteger i = 0; i < nBytes; i++) { if (p8[i]) { nz++; } }
++			const uint16_t* p16 = (const uint16_t*)tb.contents;
++			fprintf(stderr, "[mvk-diag] texelbuf %lux1 fmt=%lu: %lu/%lu bytes nonzero (%.2f%%) first16: %u %u %u %u %u %u %u %u\n",
++					(unsigned long)wCap, (unsigned long)fmtTB, (unsigned long)nz, (unsigned long)nBytes,
++					100.0 * (double)nz / (double)nBytes,
++					p16[0], p16[1], p16[2], p16[3], p16[4], p16[5], p16[6], p16[7]);
++			[tb release];
++		}];
++		[tb retain]; [tb release];
++		return;
++	}
++	if (w < 64 || h < 64) { return; }		// skip tiny utility targets
++	budget--;
++	int myIdx = idx++;
++
++	NSUInteger bpp = mvkDiagBytesPerPixel(tex.pixelFormat);
++	if (!bpp) {
++		fprintf(stderr, "[mvk-diag] skip (unhandled fmt): %lux%lu fmt=%lu\n",
++				(unsigned long)w, (unsigned long)h, (unsigned long)tex.pixelFormat);
++		return;
++	}
++	NSUInteger bpr = w * bpp;
++	id<MTLBuffer> buf = [mtlCmdBuff.device newBufferWithLength: bpr * h options: MTLResourceStorageModeShared];
++	if (!buf) { return; }
++	id<MTLBlitCommandEncoder> blit = [mtlCmdBuff blitCommandEncoder];
++	// A combined depth/stencil texture cannot be copied without naming which aspect to take.
++	MTLBlitOption blitOpts = MTLBlitOptionNone;
++	if (tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) { blitOpts = MTLBlitOptionDepthFromDepthStencil; }
++	[blit copyFromTexture: tex sourceSlice: 0 sourceLevel: 0
++			 sourceOrigin: MTLOriginMake(0, 0, 0) sourceSize: MTLSizeMake(w, h, 1)
++				 toBuffer: buf destinationOffset: 0
++	   destinationBytesPerRow: bpr destinationBytesPerImage: bpr * h
++				  options: blitOpts];
++	[blit endEncoding];
++
++	MTLPixelFormat fmt = tex.pixelFormat;
++	// MVKDIAG: for single-channel float targets (HZB mips, depth pyramids) the PPM tonemap
++	// hides the real magnitudes. Print the raw range so values can be compared against the
++	// depth buffer they are supposed to summarise.
++	if (fmt == MTLPixelFormatR16Float || fmt == MTLPixelFormatR32Float) {
++		NSUInteger sw = w, sh = h;
++		MTLPixelFormat sfmt = fmt;
++		[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mcb) {
++			NSUInteger cnt = sw * sh;
++			float mn = 1e30f, mx = -1e30f; double sum = 0.0; NSUInteger zeros = 0;
++			for (NSUInteger i = 0; i < cnt; i++) {
++				float v;
++				if (sfmt == MTLPixelFormatR16Float) { v = mvkDiagHalfToFloat(((const uint16_t*)buf.contents)[i]); }
++				else { v = ((const float*)buf.contents)[i]; }
++				if (v < mn) { mn = v; } if (v > mx) { mx = v; }
++				sum += v; if (v == 0.0f) { zeros++; }
++			}
++			// The HZB is power-of-two padded (1024x512 for a 640x360 half-res), and the padding
++			// is never written -- so a whole-texture max can report uninitialised garbage.
++			// Scan the top-left quadrant separately, which is always inside the valid region.
++			float qmn = 1e30f, qmx = -1e30f; double qsum = 0.0; NSUInteger qcnt = 0;
++			for (NSUInteger y = 0; y < sh / 2; y++) {
++				for (NSUInteger x = 0; x < sw / 2; x++) {
++					NSUInteger i = y * sw + x;
++					float v;
++					if (sfmt == MTLPixelFormatR16Float) { v = mvkDiagHalfToFloat(((const uint16_t*)buf.contents)[i]); }
++					else { v = ((const float*)buf.contents)[i]; }
++					if (v < qmn) { qmn = v; } if (v > qmx) { qmx = v; }
++					qsum += v; qcnt++;
++				}
++			}
++			fprintf(stderr, "[mvk-diag] Rfloat %lux%lu fmt=%lu: min=%.8f max=%.8f mean=%.8f zeros=%.1f%% | topleft: min=%.8f max=%.8f mean=%.8f\n",
++					(unsigned long)sw, (unsigned long)sh, (unsigned long)sfmt,
++					mn, mx, sum / (double)cnt, 100.0 * (double)zeros / (double)cnt,
++					qmn, qmx, qcnt ? qsum / (double)qcnt : 0.0);
++		}];
++	}
++	[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mcb) {
++		char path[128];
++		const char* kindName = (kind == 1) ? "tex0" : (kind == 2) ? "cmpw" : "pass";
++			snprintf(path, sizeof(path), "/tmp/mvk-%s-%03d-fmt%lu.ppm", kindName, myLogIdx, (unsigned long)fmt);
++		FILE* f = fopen(path, "wb");
++		if (f) {
++			fprintf(f, "P6\n%lu %lu\n255\n", (unsigned long)w, (unsigned long)h);
++			const uint8_t* src = (const uint8_t*)buf.contents;
++			for (NSUInteger y = 0; y < h; y++) {
++				const uint8_t* row = src + y * bpr;
++				for (NSUInteger x = 0; x < w; x++) {
++					uint8_t rgb[3];
++					switch (fmt) {
++						case MTLPixelFormatRGB10A2Unorm:
++						case MTLPixelFormatBGR10A2Unorm: {
++							uint32_t v = ((const uint32_t*)row)[x];
++							uint32_t c0 = v & 0x3FF, c1 = (v >> 10) & 0x3FF, c2 = (v >> 20) & 0x3FF;
++							uint32_t r = (fmt == MTLPixelFormatRGB10A2Unorm) ? c0 : c2;
++							uint32_t b = (fmt == MTLPixelFormatRGB10A2Unorm) ? c2 : c0;
++							rgb[0] = (uint8_t)(r >> 2); rgb[1] = (uint8_t)(c1 >> 2); rgb[2] = (uint8_t)(b >> 2);
++							break;
++						}
++						case MTLPixelFormatRGBA16Float: {
++							const uint16_t* hp = (const uint16_t*)(row + x * 8);
++							for (int k = 0; k < 3; k++) {
++								float val = mvkDiagHalfToFloat(hp[k]);
++								if (val < 0.0f) { val = 0.0f; }
++								float t = val / (val + 1.0f);		// crude tonemap, just to see structure
++								rgb[k] = (uint8_t)(t * 255.0f);
++							}
++							break;
++						}
++						case MTLPixelFormatRGBA16Unorm:
++						case MTLPixelFormatRGBA16Snorm: {
++							const uint16_t* up = (const uint16_t*)(row + x * 8);
++							for (int k = 0; k < 3; k++) { rgb[k] = (uint8_t)(up[k] >> 8); }
++							break;
++						}
++						case MTLPixelFormatRGBA32Float: {
++							const float* fp = (const float*)(row + x * 16);
++							for (int k = 0; k < 3; k++) {
++								float val = fp[k] < 0.0f ? 0.0f : fp[k];
++								rgb[k] = (uint8_t)((val / (val + 1.0f)) * 255.0f);
++							}
++							break;
++						}
++						case MTLPixelFormatR16Float: {
++							float val = mvkDiagHalfToFloat(((const uint16_t*)row)[x]);
++							if (val < 0.0f) { val = 0.0f; }
++							uint8_t g = (uint8_t)((val / (val + 1.0f)) * 255.0f);
++							rgb[0] = rgb[1] = rgb[2] = g;
++							break;
++						}
++						case MTLPixelFormatDepth32Float:
++						case MTLPixelFormatDepth32Float_Stencil8: {
++							float val = ((const float*)row)[x];
++							if (val < 0.0f) { val = 0.0f; } if (val > 1.0f) { val = 1.0f; }
++							uint8_t g = (uint8_t)(val * 255.0f);
++							rgb[0] = rgb[1] = rgb[2] = g;
++							break;
++						}
++						case MTLPixelFormatR32Float: {
++							float val = ((const float*)row)[x];
++							if (val < 0.0f) { val = 0.0f; }
++							uint8_t g = (uint8_t)((val / (val + 1.0f)) * 255.0f);
++							rgb[0] = rgb[1] = rgb[2] = g;
++							break;
++						}
++						case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Uint:
++						case MTLPixelFormatR8Snorm: case MTLPixelFormatR8Sint:
++							rgb[0] = rgb[1] = rgb[2] = row[x];
++							break;
++						case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Uint:
++						case MTLPixelFormatR16Sint:
++							rgb[0] = rgb[1] = rgb[2] = (uint8_t)(((const uint16_t*)row)[x] >> 8);
++							break;
++						case MTLPixelFormatRG11B10Float: {
++							uint32_t v = ((const uint32_t*)row)[x];
++							// 11/11/10 bit floats, 5-bit exponents, no sign
++							uint32_t parts[3] = { v & 0x7FF, (v >> 11) & 0x7FF, (v >> 22) & 0x3FF };
++							int mantBits[3] = { 6, 6, 5 };
++							for (int k = 0; k < 3; k++) {
++								int mb = mantBits[k];
++								int exp = parts[k] >> mb; int man = parts[k] & ((1 << mb) - 1);
++								float val = (exp == 0) ? man / (float)(1 << (mb + 14))
++													   : ldexpf(1.0f + man / (float)(1 << mb), exp - 15);
++								rgb[k] = (uint8_t)((val / (val + 1.0f)) * 255.0f);
++							}
++							break;
++						}
++						case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: {
++							const uint8_t* px = row + x * 4;
++							rgb[0] = px[0]; rgb[1] = px[1]; rgb[2] = px[2];
++							break;
++						}
++						default: {		// BGRA8 and friends
++							const uint8_t* px = row + x * 4;
++							rgb[0] = px[2]; rgb[1] = px[1]; rgb[2] = px[0];
++							break;
++						}
++					}
++					fwrite(rgb, 1, 3, f);
++				}
++			}
++			fclose(f);
++		}
++		[buf release];
++	}];
++	[buf retain];
++	[buf release];
++}
++
+ void MVKCommandEncoder::endRenderpass() {
+ 	if (hasMoreMultiviewPasses()) {
+ 		beginNextMultiviewPass();
+@@ -1033,7 +1371,127 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ 	}
+ 
+ 	encodeStoreActions();
++	id<MTLTexture> diagTex = _diagPassColorTex;	// MVKDIAG
++	{	// MVKDIAG
++		extern id<MTLTexture> gMVKDiagWatchTex;
++		if (diagTex && diagTex == gMVKDiagWatchTex) {
++			fprintf(stderr, "[mvk-diag] WATCH attachment: written as render target, draws=%u\n", gMVKDiagDrawCount);
++		}
++	}
++	_diagPassColorTex = nil;	// MVKDIAG
+ 	endMetalRenderEncoding();
++	{	// MVKDIAG: for the pass that writes the swapchain, report the scene texture and exposure
++		// buffer the fragment shader was handed, rather than inferring them from behaviour.
++		extern MVKDiagTexSlot gMVKDiagFragTex0Slots[8]; extern uint32_t gMVKDiagFragTex0Count;
++		extern id<MTLBuffer> gMVKDiagFragBuf2; extern NSUInteger gMVKDiagFragBuf2Offset;
++		static int reported = 0;
++		if (getenv("MVK_DIAG_TONEMAP") && diagTex && gMVKDiagDrawCount > 0 && reported < 12 &&
++			mvkDiagDelayElapsed() &&
++			diagTex.pixelFormat == MTLPixelFormatRGB10A2Unorm && diagTex.width >= 640) {
++			reported++;
++			fprintf(stderr, "[mvk-diag] swapchain pass: %u texture(0) bindings, fragBuf2=%p len=%lu off=%lu\n",
++					gMVKDiagFragTex0Count,
++					(void*)gMVKDiagFragBuf2,
++					(unsigned long)(gMVKDiagFragBuf2 ? gMVKDiagFragBuf2.length : 0),
++					(unsigned long)gMVKDiagFragBuf2Offset);
++			for (uint32_t i = 0; i < gMVKDiagFragTex0Count; i++) {
++				id<MTLTexture> t = gMVKDiagFragTex0Slots[i].tex;
++				fprintf(stderr, "[mvk-diag]   tex0[%u]=%p %lux%lu fmt=%lu type=%lu usage=%lu storage=%lu fs=%016llx\n",
++						i, (void*)t,
++						(unsigned long)(t ? t.width : 0), (unsigned long)(t ? t.height : 0),
++						(unsigned long)(t ? t.pixelFormat : 0), (unsigned long)(t ? t.textureType : 0),
++						(unsigned long)(t ? t.usage : 0), (unsigned long)(t ? t.storageMode : 0),
++						(unsigned long long)gMVKDiagFragTex0Slots[i].fragHash);
++				if (t && gMVKDiagFragTex0Slots[i].fragHash == 0x9425f8d646d52d61ULL) {	// MVKDIAG
++					extern id<MTLTexture> gMVKDiagWatchTex;
++					if (gMVKDiagWatchTex != t) {
++						gMVKDiagWatchTex = t;
++						fprintf(stderr, "[mvk-diag] WATCHING tonemap ColorTexture %p parent=%p buffer=%p %lux%lu fmt=%lu usage=%lu\n",
++								(void*)t, (void*)t.parentTexture, (void*)t.buffer,
++								(unsigned long)t.width, (unsigned long)t.height,
++								(unsigned long)t.pixelFormat, (unsigned long)t.usage);
++					}
++				}
++				if (t) { mvkDiagDumpPassTexture(t, _mtlCmdBuffer, 900 + i, gMVKDiagFragTex0Slots[i].fragHash, 1); }
++			}
++			// read back the exposure buffer
++			if (gMVKDiagFragBuf2) {
++				id<MTLBuffer> src = gMVKDiagFragBuf2;
++				NSUInteger len = MIN((NSUInteger)64, src.length - gMVKDiagFragBuf2Offset);
++				id<MTLBuffer> dst = [_mtlCmdBuffer.device newBufferWithLength: len options: MTLResourceStorageModeShared];
++				id<MTLBlitCommandEncoder> blit = [_mtlCmdBuffer blitCommandEncoder];
++				[blit copyFromBuffer: src sourceOffset: gMVKDiagFragBuf2Offset toBuffer: dst destinationOffset: 0 size: len];
++				[blit endEncoding];
++				[_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer> mcb) {
++					const float* f = (const float*)dst.contents;
++					fprintf(stderr, "[mvk-diag] exposure buffer: %.6f %.6f %.6f %.6f | %.6f %.6f %.6f %.6f\n",
++							f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
++					[dst release];
++				}];
++				[dst retain]; [dst release];
++			}
++		}
++	}
++	mvkDiagDumpPassTexture(diagTex, _mtlCmdBuffer, gMVKDiagDrawCount, gMVKDiagLastFragHash);	// MVKDIAG
++	{	// MVKDIAG: a G-buffer pass writes several attachments; attachment 0 alone hides whether
++		// base colour (albedo) survived, and black albedo would make all diffuse lighting vanish.
++		if (getenv("MVK_DIAG_DUMP_MRT") && gMVKDiagDrawCount > 50 && _diagPassDepthTex) {
++			// Deferred lighting reconstructs world position from depth; if depth is wrong every
++			// light computes against garbage while the G-buffer still looks perfect.
++			id<MTLTexture> dt = _diagPassDepthTex;
++			fprintf(stderr, "[mvk-diag] depthAttachment %lux%lu fmt=%lu storage=%lu\n",
++					(unsigned long)dt.width, (unsigned long)dt.height,
++					(unsigned long)dt.pixelFormat, (unsigned long)dt.storageMode);
++			mvkDiagDumpPassTexture(dt, _mtlCmdBuffer, 750, gMVKDiagLastFragHash, 1);
++			{	// Quantising depth to 8 bits destroys the information: with reversed-Z and an
++				// infinite far plane, real depth values are tiny (depth ~= near/z). Report the
++				// raw float range so "correct but small" can be told from "collapsed to far".
++				static int depthStatsLeft = 4;
++				if (depthStatsLeft > 0 && dt.width >= 64) {
++					depthStatsLeft--;
++					NSUInteger dw = dt.width, dh = dt.height, dbpr = dw * 4;
++					id<MTLBuffer> db = [_mtlCmdBuffer.device newBufferWithLength: dbpr * dh
++																		options: MTLResourceStorageModeShared];
++					if (db) {
++						id<MTLBlitCommandEncoder> dblit = [_mtlCmdBuffer blitCommandEncoder];
++						[dblit copyFromTexture: dt sourceSlice: 0 sourceLevel: 0
++								 sourceOrigin: MTLOriginMake(0, 0, 0) sourceSize: MTLSizeMake(dw, dh, 1)
++									 toBuffer: db destinationOffset: 0
++						   destinationBytesPerRow: dbpr destinationBytesPerImage: dbpr * dh
++									  options: MTLBlitOptionDepthFromDepthStencil];
++						[dblit endEncoding];
++						[_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer> mcb) {
++							const float* fp = (const float*)db.contents;
++							NSUInteger cnt = dw * dh, atZero = 0, atOne = 0;
++							float mn = 1e30f, mx = -1e30f; double sum = 0.0;
++							for (NSUInteger i = 0; i < cnt; i++) {
++								float v = fp[i];
++								if (v < mn) { mn = v; } if (v > mx) { mx = v; }
++								sum += v;
++								if (v == 0.0f) { atZero++; } if (v >= 0.999999f) { atOne++; }
++							}
++							fprintf(stderr, "[mvk-diag] DEPTH floats: min=%.8f max=%.8f mean=%.8f  ==0: %.1f%%  ==1: %.1f%%\n",
++									mn, mx, sum / (double)cnt,
++									100.0 * (double)atZero / (double)cnt,
++									100.0 * (double)atOne / (double)cnt);
++							[db release];
++						}];
++						[db retain]; [db release];
++					}
++				}
++			}
++		}
++		if (getenv("MVK_DIAG_DUMP_MRT") && gMVKDiagDrawCount > 50) {
++			for (uint32_t ai = 1; ai < 8; ai++) {
++				id<MTLTexture> at = _diagPassColorTexAll[ai];
++				if (at) { mvkDiagDumpPassTexture(at, _mtlCmdBuffer, 700 + ai, gMVKDiagLastFragHash); }
++			}
++		}
++		for (uint32_t ai = 0; ai < 8; ai++) { _diagPassColorTexAll[ai] = nil; }
++		_diagPassDepthTex = nil;
++	}
++	gMVKDiagDrawCount = 0; gMVKDiagLastFragHash = 0; gMVKDiagDispatchCount = 0;	// MVKDIAG
++	{ extern uint32_t gMVKDiagFragTex0Count; gMVKDiagFragTex0Count = 0; }	// MVKDIAG
+ 	MVKRenderPass *renderPass = _pEncodingContext->getRenderPass();
+ 	if (renderPass) { renderPass->encodeSubpassDependencyBarriers(this, VK_SUBPASS_EXTERNAL); }
+ 	if ( !mvkIsAnyFlagEnabled(_pEncodingContext->getRenderingFlags(), VK_RENDERING_SUSPENDING_BIT) ) {
+@@ -1064,6 +1522,28 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+ 	endMetalEncoding(_mtlComputeEncoder);
+ 	_mtlComputeEncoderUse = kMVKCommandUseNone;
+ 
++	{	// MVKDIAG
++		extern MVKDiagTexSlot gMVKDiagComputeWriteSlots[24]; extern uint32_t gMVKDiagComputeWriteCount;
++		static id<MTLTexture> seen[512] = {}; static uint32_t seenCount = 0;
++		if (getenv("MVK_DIAG_DUMP_COMPUTE") && gMVKDiagComputeWriteCount && mvkDiagDelayElapsed()) {
++			for (uint32_t i = 0; i < gMVKDiagComputeWriteCount; i++) {
++				id<MTLTexture> t = gMVKDiagComputeWriteSlots[i].tex;
++				if (!t) { continue; }
++				bool dup = false;
++				for (uint32_t k = 0; k < seenCount; k++) { if (seen[k] == t) { dup = true; break; } }
++				if (dup || seenCount >= 512) { continue; }
++				seen[seenCount++] = t;
++				fprintf(stderr, "[mvk-diag] computeWrite: %p %lux%lu fmt=%lu type=%lu storage=%lu idx=%llu\n",
++						(void*)t, (unsigned long)t.width, (unsigned long)t.height,
++						(unsigned long)t.pixelFormat, (unsigned long)t.textureType,
++						(unsigned long)t.storageMode,
++						(unsigned long long)gMVKDiagComputeWriteSlots[i].fragHash);
++				mvkDiagDumpPassTexture(t, _mtlCmdBuffer, 800 + seenCount, 0, 2);
++			}
++		}
++		gMVKDiagComputeWriteCount = 0;
++	}
++
+ 	if (_mtlBlitEncoder && _cmdBuffer->_hasStageCounterTimestampCommand) { [_mtlBlitEncoder updateFence: getStageCountersMTLFence()]; }
+ 	endMetalEncoding(_mtlBlitEncoder);
+     _mtlBlitEncoderUse = kMVKCommandUseNone;
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 7d16b94..69b1787 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -188,6 +188,10 @@ static void setSampler(id<MTLComputeCommandEncoder> encoder, id<MTLSamplerState>
+ static void bindBuffer(Encoder encoder, id<MTLBuffer> buffer, VkDeviceSize offset, NSUInteger index,
+                        MVKStageResourceBits& exists, MVKStageResourceBindings& bindings, const Binder& binder) {
+ 	assert(index < kMVKMaxBufferCount);
++	{	// MVKDIAG: remember the fragment stage's exposure buffer (UE5 binds it at buffer 2).
++		extern bool gMVKDiagBindingFragment; extern id<MTLBuffer> gMVKDiagFragBuf2; extern NSUInteger gMVKDiagFragBuf2Offset;
++		if (gMVKDiagBindingFragment && index == 2) { gMVKDiagFragBuf2 = buffer; gMVKDiagFragBuf2Offset = (NSUInteger)offset; }
++	}
+ 	if (buffer) {
+ 		if (!exists.buffers.get(index) || bindings.buffers[index].buffer != buffer) {
+ 			exists.buffers.set(index);
+@@ -235,10 +239,96 @@ static void bindVertexBuffer(id<MTLCommandEncoder> encoder, id<MTLBuffer> buffer
+ 	}
+ }
+ 
++id<MTLTexture> gMVKDiagFragTex0 = nil;	// MVKDIAG
++id<MTLBuffer> gMVKDiagFragBuf2 = nil;	// MVKDIAG
++NSUInteger gMVKDiagFragBuf2Offset = 0;	// MVKDIAG
++bool gMVKDiagBindingFragment = false;	// MVKDIAG
++// MVKDIAG: the *last* binding is not enough -- a pass that draws the tonemapper and then the UI
++// overwrites it. Record every distinct texture bound at fragment texture(0) during the pass,
++// tagged with the fragment shader that was current when it was bound.
++struct MVKDiagTexSlot { id<MTLTexture> tex; uint64_t fragHash; };
++MVKDiagTexSlot gMVKDiagFragTex0Slots[8] = {};	// MVKDIAG
++uint32_t gMVKDiagFragTex0Count = 0;	// MVKDIAG
++// MVKDIAG: the render-pass dumps leave a blind spot exactly where the image goes missing --
++// UE5 does deferred lighting and most of the post chain in compute, writing to storage images
++// that are never render-pass attachments. Record every writable texture a compute dispatch binds.
++MVKDiagTexSlot gMVKDiagComputeWriteSlots[24] = {};	// MVKDIAG
++uint32_t gMVKDiagComputeWriteCount = 0;	// MVKDIAG
++bool gMVKDiagBindingCompute = false;	// MVKDIAG
++
++uint64_t gMVKDiagLastCompHash = 0;	// MVKDIAG
++id<MTLTexture> gMVKDiagWatchTex = nil;	// MVKDIAG: set to the tonemapper's ColorTexture
++uint32_t gMVKDiagWatchHits = 0;	// MVKDIAG
++
++static void mvkDiagRecordTexBind(id<MTLTexture> texture, NSUInteger index) {	// MVKDIAG
++	if (gMVKDiagBindingCompute && texture) {	// MVKDIAG: every compute texture bind, undeduplicated
++		static uint32_t csLogged = 0;
++		extern bool mvkDiagDelayElapsedExt();
++		if (getenv("MVK_DIAG_CS_BINDS") && csLogged < 4000 && mvkDiagDelayElapsedExt()) {
++			csLogged++;
++			fprintf(stderr, "[mvk-diag] csbind cs=%016llx tex(%lu)=%p %lux%lu fmt=%lu usage=%lu\n",
++					(unsigned long long)gMVKDiagLastCompHash, (unsigned long)index, (void*)texture,
++					(unsigned long)texture.width, (unsigned long)texture.height,
++					(unsigned long)texture.pixelFormat, (unsigned long)texture.usage);
++		}
++	}
++	if (texture && gMVKDiagWatchTex && gMVKDiagWatchHits < 200 &&
++		(texture == gMVKDiagWatchTex ||
++		 texture.parentTexture == gMVKDiagWatchTex ||
++		 (gMVKDiagWatchTex.parentTexture && texture == gMVKDiagWatchTex.parentTexture) ||
++		 (texture.parentTexture && texture.parentTexture == gMVKDiagWatchTex.parentTexture) ||
++		 (texture.buffer && texture.buffer == gMVKDiagWatchTex.buffer))) {	// MVKDIAG
++		gMVKDiagWatchHits++;
++		extern uint64_t gMVKDiagLastFragHash;
++		fprintf(stderr, "[mvk-diag] WATCH bind: tex=%p parent=%p idx=%lu stage=%s usage=%lu fs=%016llx cs=%016llx\n",
++				(void*)texture, (void*)texture.parentTexture, (unsigned long)index,
++				gMVKDiagBindingCompute ? "compute" : gMVKDiagBindingFragment ? "fragment" : "vertex/other",
++				(unsigned long)texture.usage, (unsigned long long)gMVKDiagLastFragHash,
++				(unsigned long long)gMVKDiagLastCompHash);
++	}
++	if (gMVKDiagBindingCompute && texture && (texture.usage & MTLTextureUsageShaderWrite)) {
++		bool seenC = false;
++		for (uint32_t i = 0; i < gMVKDiagComputeWriteCount; i++) {
++			if (gMVKDiagComputeWriteSlots[i].tex == texture) { seenC = true; break; }
++		}
++		if (!seenC && gMVKDiagComputeWriteCount < 24) {
++			gMVKDiagComputeWriteSlots[gMVKDiagComputeWriteCount].tex = texture;
++			gMVKDiagComputeWriteSlots[gMVKDiagComputeWriteCount].fragHash = index;
++			gMVKDiagComputeWriteCount++;
++		}
++	}
++	if (gMVKDiagBindingFragment && index == 0) {
++		gMVKDiagFragTex0 = texture;
++		extern uint64_t gMVKDiagLastFragHash;
++		bool seen = false;
++		for (uint32_t i = 0; i < gMVKDiagFragTex0Count; i++) {
++			if (gMVKDiagFragTex0Slots[i].tex == texture) { seen = true; break; }
++		}
++		if (!seen && gMVKDiagFragTex0Count < 8) {
++			gMVKDiagFragTex0Slots[gMVKDiagFragTex0Count].tex = texture;
++			gMVKDiagFragTex0Slots[gMVKDiagFragTex0Count].fragHash = gMVKDiagLastFragHash;
++			gMVKDiagFragTex0Count++;
++		}
++	}
++}
++
++// MVKDIAG: report bindings dropped by the live check -- a silent failure by construction.
++void mvkDiagLiveCheckFailed(id<MTLTexture> tex, NSUInteger index) {
++	static uint32_t dropped = 0;
++	extern bool mvkDiagDelayElapsedExt();
++	if (!getenv("MVK_DIAG_LIVECHECK") || !mvkDiagDelayElapsedExt()) { return; }
++	if (dropped++ > 200) { return; }
++	fprintf(stderr, "[mvk-diag] LIVE-CHECK DROPPED texture(%lu) %p %lux%lu fmt=%lu usage=%lu compute=%d frag=%d\n",
++			(unsigned long)index, (void*)tex, (unsigned long)tex.width, (unsigned long)tex.height,
++			(unsigned long)tex.pixelFormat, (unsigned long)tex.usage,
++			gMVKDiagBindingCompute ? 1 : 0, gMVKDiagBindingFragment ? 1 : 0);
++}
++
+ template <typename Binder, typename Encoder>
+ static void bindTexture(Encoder encoder, id<MTLTexture> texture, NSUInteger index,
+                         MVKStageResourceBits& exists, MVKStageResourceBindings& bindings, const Binder& binder) {
+ 	assert(index < kMVKMaxTextureCount);
++	mvkDiagRecordTexBind(texture, index);	// MVKDIAG
+ 	if (!exists.textures.get(index) || bindings.textures[index] != texture) {
+ 		exists.textures.set(index);
+ 		binder.setTexture(encoder, texture, index);
+@@ -394,6 +484,9 @@ static void bindDescriptorSets(MVKImplicitBufferData& target,
+ 	assert(dynamicOffsets == dynamicOffsetsEnd && "All dynamic offsets should have been used, and no more than that");
+ }
+ 
++/** Size of the zero-filled block bound for a shader that reads push constants its layout never declared. */
++static constexpr size_t kMVKUndeclaredPushConstantsSize = 256;
++
+ static void bindImmediateData(id<MTLCommandEncoder> encoder,
+                               MVKCommandEncoder& mvkEncoder,
+                               const uint8_t* data, size_t size,
+@@ -494,9 +587,13 @@ static void executeBindOp(id<MTLCommandEncoder> encoder,
+ 					if (exists.textures.get(target + i) && bindings.textures[target + i] == resource) {
+ 						// Already bound
+ 					} else if (auto live = dev->getLiveResources().isLive(tex)) {
++						mvkDiagRecordTexBind(tex, target + i);	// MVKDIAG: this path bypasses bindTexture()
+ 						exists.textures.set(target + i);
+ 						bindings.textures[target + i] = tex;
+ 						binder.setTexture(encoder, tex, target + i);
++					} else {	// MVKDIAG: a failed live check silently leaves the slot unbound
++						extern void mvkDiagLiveCheckFailed(id<MTLTexture> tex, NSUInteger index);
++						mvkDiagLiveCheckFailed(tex, target + i);
+ 					}
+ 				} else {
+ 					bindTexture(encoder, nullptr, target + i, exists, bindings, binder);
+@@ -638,6 +735,8 @@ static void bindMetalResources(id<MTLCommandEncoder> encoder,
+                                MVKStageResourceBits& exists,
+                                MVKStageResourceBindings& bindings,
+                                const MVKResourceBinder& RESTRICT binder) {
++	gMVKDiagBindingFragment = (vkStage == kMVKShaderStageFragment);	// MVKDIAG: must precede all binding
++	gMVKDiagBindingCompute = (vkStage == kMVKShaderStageCompute);	// MVKDIAG
+ 	// Clear descriptor set resource use bitarray for new sets and bind them
+ 	MVKStaticBitSet<kMVKMaxDescriptorSetCount> setsNeeded = resources.resources.descriptorSetData.clearingAllIn(exists.descriptorSetData);
+ 	exists.descriptorSetData |= resources.resources.descriptorSetData;
+@@ -676,9 +775,19 @@ static void bindMetalResources(id<MTLCommandEncoder> encoder,
+ 		exists.buffers.set(resources.implicitBuffers.ids[buffer]);
+ 		bindings.buffers[idx] = MVKStageResourceBindings::ImplicitBuffer(buffer);
+ 		switch (nvbuffer) {
+-			case MVKNonVolatileImplicitBuffer::PushConstant:
+-				bindImmediateData(encoder, mvkEncoder, pushConstants, common._layout->getPushConstantsLength(), idx, binder);
++			case MVKNonVolatileImplicitBuffer::PushConstant: {
++				uint32_t pcLen = common._layout->getPushConstantsLength();
++				if (pcLen) {
++					bindImmediateData(encoder, mvkEncoder, pushConstants, pcLen, idx, binder);
++				} else {
++					// The shader reads push constants that the pipeline layout does not declare, so no
++					// content was ever pushed. Vulkan leaves the values undefined, but Metal still needs
++					// something bound at the index the shader references.
++					static const uint8_t zeroPushConstants[kMVKUndeclaredPushConstantsSize] = {};
++					bindImmediateData(encoder, mvkEncoder, zeroPushConstants, sizeof(zeroPushConstants), idx, binder);
++				}
+ 				break;
++			}
+ 			case MVKNonVolatileImplicitBuffer::Swizzle:
+ 				bindImmediateData(encoder, mvkEncoder, getImplicitBindingData(implicitBufferData.textureSwizzles, resourceCounts.textureIndex), idx, binder);
+ 				break;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 9772757..e668a24 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -2782,6 +2782,17 @@
+ 	_features.vertexPipelineStoresAndAtomics = true;
+ 	_features.fragmentStoresAndAtomics = true;
+ 
++	// MVKX: DXVK refuses to expose ANY D3D feature level unless these bits are set, and
++	// without them D3D11 titles cannot create a device at all on Metal. Metal has no
++	// geometry shaders, but D3D11 games essentially never use them, so claiming the bit
++	// costs nothing in practice -- CrossOver's MoltenVK fork forces exactly these three.
++	// Opt-in via env so the plain Vulkan path keeps reporting the truth.
++	if (getenv("MVK_X_DXVK_FEATURES")) {
++		_features.geometryShader = true;        // required by DXVK for D3D10/11
++		_features.shaderCullDistance = true;    // required by DXVK for 10level9
++		_features.pipelineStatisticsQuery = true;
++	}
++
+ 	_features.shaderSampledImageArrayDynamicIndexing = _metalFeatures.arrayOfTextures;
+ 	_features.textureCompressionBC = _gpuCapabilities.supportsBCTextureCompression;
+ 
+@@ -2793,6 +2804,13 @@
+     _features.shaderStorageImageArrayDynamicIndexing = _metalFeatures.arrayOfTextures;
+     _features.depthBounds = _metalFeatures.depthBoundsTest;
+ 
++    // MVKX: id Tech 6 (DOOM 2016) requires depthBounds at vkCreateDevice and aborts
++    // without it. Metal only has depth bounds testing on Apple10+ GPUs. The encoder
++    // gates the real setDepthBounds call on _metalFeatures.depthBoundsTest (left false),
++    // so claiming the feature makes the state a silent no-op -- depth bounds is a
++    // culling optimisation, so the worst case is some overdraw, not incorrect output.
++    if (getenv("MVK_X_FAKE_DEPTH_BOUNDS")) { _features.depthBounds = true; }
++
+     if ( supportsMTLGPUFamily(Apple1) ) {
+         _features.textureCompressionETC2 = true;
+         _features.textureCompressionASTC_LDR = true;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index ef8ca60..ea9c08d 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -1637,9 +1637,85 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 
+ // Present the drawable and make myself available only once the command buffer has completed.
+ // Pass MVKImagePresentInfo by value because it may not exist when the callback runs.
++// MVKDIAG: dump the image actually handed to the display, so what the game presents can be
++// inspected without screen capture (screencapture on this machine returns a stale framebuffer).
++// Set MVK_DIAG_DUMP_PRESENT=<n> to write every n-th presented frame to /tmp/mvk-present-<i>.ppm.
++static void mvkDiagDumpPresentedImage(id<MTLTexture> tex, id<MTLCommandBuffer> mtlCmdBuff) {
++	static int32_t interval = -1;
++	static uint64_t frameCount = 0;
++	static int32_t dumpIdx = 0;
++	static time_t startTime = 0;
++	static time_t afterSecs = 0;
++	if (interval < 0) {
++		const char* env = getenv("MVK_DIAG_DUMP_PRESENT");
++		interval = env ? atoi(env) : 0;
++		const char* delay = getenv("MVK_DIAG_PRESENT_AFTER");
++		afterSecs = delay ? atoi(delay) : 0;
++		startTime = time(NULL);
++	}
++	if (afterSecs && (time(NULL) - startTime) < afterSecs) { return; }
++	if (interval <= 0 || !tex) { return; }
++	fprintf(stderr, "[mvk-diag] ---- frame %llu presented ----\n", (unsigned long long)frameCount);
++	if ((frameCount++ % (uint64_t)interval) != 0) { return; }
++	if (dumpIdx >= 24) { return; }
++
++	NSUInteger w = tex.width, h = tex.height, bpr = w * 4;
++	id<MTLDevice> dev = mtlCmdBuff.device;
++	id<MTLBuffer> buf = [dev newBufferWithLength: bpr * h options: MTLResourceStorageModeShared];
++	if (!buf) { return; }
++	id<MTLBlitCommandEncoder> blit = [mtlCmdBuff blitCommandEncoder];
++	[blit copyFromTexture: tex sourceSlice: 0 sourceLevel: 0
++			 sourceOrigin: MTLOriginMake(0, 0, 0) sourceSize: MTLSizeMake(w, h, 1)
++				 toBuffer: buf destinationOffset: 0
++		destinationBytesPerRow: bpr destinationBytesPerImage: bpr * h];
++	[blit endEncoding];
++
++	int idx = dumpIdx++;
++	MTLPixelFormat pixFmt = tex.pixelFormat;
++	fprintf(stderr, "[mvk-diag] present dump %d: %lux%lu MTLPixelFormat=%lu\n", idx,
++			(unsigned long)w, (unsigned long)h, (unsigned long)pixFmt);
++	[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mcb) {
++		char path[128];
++		snprintf(path, sizeof(path), "/tmp/mvk-present-%d.ppm", idx);
++		FILE* f = fopen(path, "wb");
++		if (f) {
++			fprintf(f, "P6\n%lu %lu\n255\n", (unsigned long)w, (unsigned long)h);
++			const uint8_t* src = (const uint8_t*)buf.contents;
++			bool bgra8 = (pixFmt == MTLPixelFormatBGRA8Unorm || pixFmt == MTLPixelFormatBGRA8Unorm_sRGB);
++			bool rgba8 = (pixFmt == MTLPixelFormatRGBA8Unorm || pixFmt == MTLPixelFormatRGBA8Unorm_sRGB);
++			bool rgb10 = (pixFmt == MTLPixelFormatRGB10A2Unorm);
++			bool bgr10 = (pixFmt == MTLPixelFormatBGR10A2Unorm);
++			for (NSUInteger y = 0; y < h; y++) {
++				const uint8_t* row = src + y * bpr;
++				for (NSUInteger x = 0; x < w; x++) {
++					const uint8_t* px = row + x * 4;
++					uint8_t rgb[3];
++					if (rgb10 || bgr10) {
++						uint32_t v = ((const uint32_t*)row)[x];
++						uint32_t c0 = v & 0x3FF, c1 = (v >> 10) & 0x3FF, c2 = (v >> 20) & 0x3FF;
++						uint32_t r = rgb10 ? c0 : c2, g = c1, b = rgb10 ? c2 : c0;
++						rgb[0] = (uint8_t)(r >> 2); rgb[1] = (uint8_t)(g >> 2); rgb[2] = (uint8_t)(b >> 2);
++					} else if (rgba8) {
++						rgb[0] = px[0]; rgb[1] = px[1]; rgb[2] = px[2];
++					} else {	// assume BGRA8
++						rgb[0] = px[2]; rgb[1] = px[1]; rgb[2] = px[0];
++					}
++					(void)bgra8;
++					fwrite(rgb, 1, 3, f);
++				}
++			}
++			fclose(f);
++		}
++		[buf release];
++	}];
++	[buf retain];
++	[buf release];
++}
++
+ VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffer> mtlCmdBuff,
+ 															  MVKImagePresentInfo presentInfo) {
+ 	_swapchain->renderWatermark(getMTLTexture(0), mtlCmdBuff);
++	mvkDiagDumpPresentedImage(getMTLTexture(0), mtlCmdBuff);	// MVKDIAG
+ 
+ 	// According to Apple, it is more performant to call MTLDrawable present from within a
+ 	// MTLCommandBuffer scheduled-handler than it is to call MTLCommandBuffer presentDrawable:.
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index e385e9b..01161a9 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -343,8 +343,8 @@ protected:
+     void initShaderConversionConfig(mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData);
+ 	void initReservedVertexAttributeBufferCount(const VkGraphicsPipelineCreateInfo* pCreateInfo);
+     void addVertexInputToShaderConversionConfig(mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkGraphicsPipelineCreateInfo* pCreateInfo);
+-    void addNextStageInputToShaderConversionConfig(mvk::SPIRVToMSLConversionConfiguration& shaderConfig, SPIRVShaderInputs& inputs);
+-    void addPrevStageOutputToShaderConversionConfig(mvk::SPIRVToMSLConversionConfiguration& shaderConfig, SPIRVShaderOutputs& outputs);
++    void addNextStageInputToShaderConversionConfig(mvk::SPIRVToMSLConversionConfiguration& shaderConfig, SPIRVShaderInputs& inputs, bool skipBuiltins = false);
++    void addPrevStageOutputToShaderConversionConfig(mvk::SPIRVToMSLConversionConfiguration& shaderConfig, SPIRVShaderOutputs& outputs, bool skipBuiltins = false);
+     MTLRenderPipelineDescriptor* newMTLRenderPipelineDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData, const VkPipelineShaderStageCreateInfo* pVertexSS, VkPipelineCreationFeedback* pVertexFB, const VkPipelineShaderStageCreateInfo* pFragmentSS, VkPipelineCreationFeedback* pFragmentFB);
+     MTLComputePipelineDescriptor* newMTLTessVertexStageDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData, mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkPipelineShaderStageCreateInfo* pVertexSS, VkPipelineCreationFeedback* pVertexFB, const VkPipelineShaderStageCreateInfo* pTessCtlSS, MVKMTLFunction* pVtxFunctions);
+ 	MTLComputePipelineDescriptor* newMTLTessControlStageDescriptor(const VkGraphicsPipelineCreateInfo* pCreateInfo, const mvk::SPIRVTessReflectionData& reflectData, mvk::SPIRVToMSLConversionConfiguration& shaderConfig, const VkPipelineShaderStageCreateInfo* pTessCtlSS, VkPipelineCreationFeedback* pTessCtlFB, const VkPipelineShaderStageCreateInfo* pVertexSS, const VkPipelineShaderStageCreateInfo* pTessEvalSS);
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 7eae64c..5b951b6 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -159,14 +159,16 @@ static void addResourceBindingToShaderConfig(SPIRVToMSLConversionConfiguration&
+ 	shaderConfig.discreteDescriptorSets.clear();
+ 	shaderConfig.dynamicBufferDescriptors.clear();
+ 
+-	// Add any resource bindings used by push-constants.
++	// Add the resource bindings used by push-constants. A binding is added for every stage, including
++	// those this pipeline layout declares no push constant range for, because a shader is still free
++	// to declare push constants that the layout does not cover. Without a binding, the converter would
++	// give the push constant argument Metal buffer index 0, colliding with the first buffer of the
++	// first descriptor set. Unused bindings are ignored by the converter.
+ 	for (uint32_t i = 0; i < kMVKShaderStageCount; i++) {
+ 		auto stage = static_cast<MVKShaderStage>(i);
+-		if (stageUsesPushConstants(stage)) {
+-			MVKShaderStageResourceBinding binding = {};
+-			binding.bufferIndex = getPushConstantResourceIndex(stage);
+-			addResourceBindingToShaderConfig(shaderConfig, binding, stage, kPushConstDescSet, kPushConstBinding, 1, MVKDescriptorGPULayout::Buffer);
+-		}
++		MVKShaderStageResourceBinding binding = {};
++		binding.bufferIndex = getPushConstantResourceIndex(stage);
++		addResourceBindingToShaderConfig(shaderConfig, binding, stage, kPushConstDescSet, kPushConstBinding, 1, MVKDescriptorGPULayout::Buffer);
+ 	}
+ 
+ 	for (uint32_t dslIdx = 0; dslIdx < _descriptorSetLayouts.size(); dslIdx++) {
+@@ -376,9 +378,10 @@ static bool isWriteable(VkDescriptorType type) {
+ 	}
+ 
+ 	for (uint32_t stage = 0; stage < kMVKShaderStageCount; stage++) {
+-		ret->_pushConstantResourceIndices[stage] = static_cast<uint8_t>(ret->_mtlResourceCounts.stages[stage].bufferIndex);
+-		if (ret->stageUsesPushConstants(static_cast<MVKShaderStage>(stage)))
++		if (ret->stageUsesPushConstants(static_cast<MVKShaderStage>(stage))) {
++			ret->_pushConstantResourceIndices[stage] = static_cast<uint8_t>(ret->_mtlResourceCounts.stages[stage].bufferIndex);
+ 			++ret->_mtlResourceCounts.stages[stage].bufferIndex;
++		}
+ 	}
+ 
+ 	for (size_t i = 0; i < layouts.size(); i++) {
+@@ -392,6 +395,17 @@ static bool isWriteable(VkDescriptorType type) {
+ 			ret->_pushDescriptor = i;
+ 	}
+ 
++	// A shader is permitted to declare push constants that the pipeline layout does not cover for
++	// that stage. Vulkan leaves the content undefined rather than failing, and real engines do ship
++	// shaders like that. Give those stages the first buffer index past the descriptor content, so
++	// that if such a shader turns up, its push constant argument does not land on the same Metal
++	// buffer index as the first buffer of the first descriptor set, which will not compile.
++	for (uint32_t stage = 0; stage < kMVKShaderStageCount; stage++) {
++		if ( !ret->stageUsesPushConstants(static_cast<MVKShaderStage>(stage)) ) {
++			ret->_pushConstantResourceIndices[stage] = static_cast<uint8_t>(ret->_mtlResourceCounts.stages[stage].bufferIndex);
++		}
++	}
++
+ 	return ret;
+ }
+ 
+@@ -492,6 +506,11 @@ static void populateResourceUsage(MVKPipelineStageResourceInfo& dst, SPIRVToMSLC
+ 
+ // Do updates that may require a render pass restart immediately on bind.
+ void MVKGraphicsPipeline::wasBound(MVKCommandEncoder* cmdEncoder) {
++	{	// MVKDIAG: remember which fragment shader this pass used, so the failing pass can be matched
++		// against the files written by MVK_CONFIG_SHADER_DUMP_DIR.
++		extern uint64_t gMVKDiagLastFragHash;
++		if (_fragmentModule) { gMVKDiagLastFragHash = _fragmentModule->getKey().codeHash; }
++	}
+ 	if (_hasRemappedAttachmentLocations) {
+ 		cmdEncoder->updateColorAttachmentLocations(_colorAttachmentLocations.contents());
+ 	}
+@@ -1508,6 +1527,19 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 	setEmulatedReversedDepthViewportConfig(shaderConfig, implicit, getPhysicalDevice()->shouldEmulateReversedDepthViewport());
+ 	addVertexInputToShaderConversionConfig(shaderConfig, pCreateInfo);
+ 
++	// Metal requires every fragment shader input to be written by the vertex shader, with a matching
++	// type, but Vulkan does not: an input with no matching output simply reads undefined values.
++	// Tell the converter what the fragment shader reads, so it can declare any missing outputs.
++	if (pFragmentSS && _fragmentModule) {
++		SPIRVShaderInputs fragInputs;
++		std::string errorLog;
++		if (getShaderInputs(_fragmentModule->getSPIRV(), spv::ExecutionModelFragment, pFragmentSS->pName, fragInputs, errorLog) ) {
++			addNextStageInputToShaderConversionConfig(shaderConfig, fragInputs, true);
++		} else {
++			reportWarning(VK_ERROR_INITIALIZATION_FAILED, "Failed to get fragment inputs: %s", errorLog.c_str());
++		}
++	}
++
+ 	MVKMTLFunction func = getMTLFunction(shaderConfig, pVertexSS, pVertexFB, _vertexModule, "Vertex");
+ 	id<MTLFunction> mtlFunc = func.getMTLFunction();
+ 	plDesc.vertexFunction = mtlFunc;
+@@ -1690,7 +1722,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 		if (std::any_of(shaderOutputs.begin(), shaderOutputs.end(), [](const SPIRVShaderOutput& output) { return output.builtin == spv::BuiltInLayer; })) {
+ 			shaderConfig.options.mslOptions.arrayed_subpass_input = true;
+ 		}
+-		addPrevStageOutputToShaderConversionConfig(shaderConfig, shaderOutputs);
++		addPrevStageOutputToShaderConversionConfig(shaderConfig, shaderOutputs, true);
+ 
+ 		MVKMTLFunction func = getMTLFunction(shaderConfig, pFragmentSS, pFragmentFB, _fragmentModule, "Fragment");
+ 		id<MTLFunction> mtlFunc = func.getMTLFunction();
+@@ -2249,18 +2281,21 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 
+ // Initializes the shader outputs in a shader conversion config from the next stage input.
+ void MVKGraphicsPipeline::addNextStageInputToShaderConversionConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+-                                                                    SPIRVShaderInputs& shaderInputs) {
++                                                                    SPIRVShaderInputs& shaderInputs,
++                                                                    bool skipBuiltins) {
+     shaderConfig.shaderOutputs.clear();
+ 
+ 	mvk::MSLShaderInterfaceVariable so;
+ 	auto& sosv = so.shaderVar;
+ 	for (auto& si : shaderInputs) {
+ 		if ( !si.isUsed ) { continue; }
++		if (skipBuiltins && si.builtin != spv::BuiltInMax) { continue; }
+ 
+         sosv.location = si.location;
+ 		sosv.component = si.component;
+         sosv.builtin = si.builtin;
+         sosv.vecsize = si.vecWidth;
++		sosv.basetype = si.baseType;
+ 		sosv.rate = si.perPatch ? MSL_SHADER_VARIABLE_RATE_PER_PATCH : MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
+ 
+         switch (getPixelFormats()->getFormatType(mvkFormatFromOutput(si) ) ) {
+@@ -2294,18 +2329,21 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 
+ // Initializes the shader inputs in a shader conversion config from the previous stage output.
+ void MVKGraphicsPipeline::addPrevStageOutputToShaderConversionConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+-                                                                     SPIRVShaderOutputs& shaderOutputs) {
++                                                                     SPIRVShaderOutputs& shaderOutputs,
++                                                                     bool skipBuiltins) {
+     shaderConfig.shaderInputs.clear();
+ 
+ 	mvk::MSLShaderInput si;
+ 	auto& sisv = si.shaderVar;
+ 	for (auto& so : shaderOutputs) {
+ 		if ( !so.isUsed ) { continue; }
++		if (skipBuiltins && so.builtin != spv::BuiltInMax) { continue; }
+ 
+         sisv.location = so.location;
+ 		sisv.component = so.component;
+         sisv.builtin = so.builtin;
+         sisv.vecsize = so.vecWidth;
++		sisv.basetype = so.baseType;
+ 		sisv.rate = so.perPatch ? MSL_SHADER_VARIABLE_RATE_PER_PATCH : MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
+ 
+         switch (getPixelFormats()->getFormatType(mvkFormatFromOutput(so) ) ) {
+@@ -2483,6 +2521,22 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ }
+ 
+ // Returns a MTLFunction to use when creating the MTLComputePipelineState.
++// MVKDIAG: compute pipelines have no wasBound() hook, so record the hash against the pipeline
++// pointer at creation and look it up when a dispatch is encoded.
++#include <unordered_map>
++#include <mutex>
++static std::mutex gMVKDiagCompHashLock;
++static std::unordered_map<const void*, uint64_t> gMVKDiagCompHashes;
++void mvkDiagSetCompHash(const void* pipeline, uint64_t hash) {
++	std::lock_guard<std::mutex> lock(gMVKDiagCompHashLock);
++	gMVKDiagCompHashes[pipeline] = hash;
++}
++uint64_t mvkDiagGetCompHash(const void* pipeline) {
++	std::lock_guard<std::mutex> lock(gMVKDiagCompHashLock);
++	auto it = gMVKDiagCompHashes.find(pipeline);
++	return it == gMVKDiagCompHashes.end() ? 0 : it->second;
++}
++
+ MVKMTLFunction MVKComputePipeline::getMTLFunction(const VkComputePipelineCreateInfo* pCreateInfo,
+ 												  VkPipelineCreationFeedback* pStageFB) {
+ 
+@@ -2490,6 +2544,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+     if ( !mvkAreAllFlagsEnabled(pSS->stage, VK_SHADER_STAGE_COMPUTE_BIT) ) { return MVKMTLFunctionNull; }
+ 
+ 	_module = getOrCreateShaderModule(_device, pSS, _ownsModule);
++	mvkDiagSetCompHash(this, _module ? _module->getKey().codeHash : 0);	// MVKDIAG
+ 
+ 	warnIfUnsupportedRobustnessEnabled(this, pSS);
+ 
+@@ -2922,7 +2977,8 @@ void serialize(Archive & archive, MSLShaderInterfaceVariable& si) {
+ 				si.format,
+ 				si.builtin,
+ 				si.vecsize,
+-				si.rate);
++				si.rate,
++				si.basetype);
+ 	}
+ 
+ 	template<class Archive>
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
+index 5f5e99e..d23c92c 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPixelFormats.mm
+@@ -320,6 +320,25 @@
+ }
+ 
+ VkFormatProperties3& MVKPixelFormats::getVkFormatProperties3(VkFormat vkFormat) {
++	// MVKX: UE5 builds its HZB as R16_SFLOAT but its HZB shaders declare the storage image as
++	// R32f. Vulkan says a storage-image format mismatch yields undefined values for the whole
++	// image, and the HZB measurably contains values larger than the depth buffer it reduces.
++	// Withholding STORAGE_IMAGE from R16_SFLOAT pushes UE5 onto a wider format that matches
++	// its shader. Opt-in, because it changes advertised capabilities.
++	if (vkFormat == VK_FORMAT_R16_SFLOAT) {
++		static int noR16FStorage = -1;
++		if (noR16FStorage < 0) { noR16FStorage = getenv("MVK_X_NO_R16F_STORAGE") ? 1 : 0; }
++		if (noR16FStorage) {
++			auto& d = getVkFormatDesc(vkFormat);
++			d.properties.optimalTilingFeatures &= ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
++													VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
++													VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT);
++			d.properties.linearTilingFeatures &= ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
++												   VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
++												   VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT);
++			return d.properties;
++		}
++	}
+ 	return getVkFormatDesc(vkFormat).properties;
+ }
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm b/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
+index b684166..134e10c 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKRenderPass.mm
+@@ -786,6 +786,34 @@ static size_t getAttachmentCount(const MVKArrayRef<uint32_t> colorAttIdxs,
+ 
+ VkSampleCountFlagBits MVKAttachmentDescription::getSampleCount() { return _info.samples; }
+ 
++
++// MVKX: aggregate TBDR load/store accounting (MVK_X_PASSSTATS=1).
++// On tile-based hardware the expensive mistake is Load/Store on a full-screen attachment
++// instead of leaving it resident in tile memory. Counts, not per-call spam.
++static int gMVKXPSEnabled  = -1;   // getenv() is on a ~2000/sec path; resolve once
++static int gMVKXDiscardDepth = -1;
++static inline bool mvkxPassStatsOn()   { if (gMVKXPSEnabled   < 0) gMVKXPSEnabled   = getenv("MVK_X_PASSSTATS") ? 1 : 0; return gMVKXPSEnabled; }
++static inline bool mvkxDiscardDepthOn(){ if (gMVKXDiscardDepth< 0) gMVKXDiscardDepth= getenv("MVK_X_TBDR_DISCARD_DEPTH") ? 1 : 0; return gMVKXDiscardDepth; }
++static struct { unsigned long loads, clears, dontcares, stores, storeDontCares, memoryless, attachments;
++                unsigned long long loadBytes, attBytes;
++                unsigned long depthAtt, depthReadable, depthUnknown; } gMVKXPS;
++static void mvkxPassStatsTick() {
++	static time_t last = 0;
++	time_t now = time(NULL);
++	if (!last) { last = now; return; }
++	if (now - last < 5) { return; }
++	double secs = (double)(now - last);
++	double loadGBs  = (double)gMVKXPS.loadBytes / secs / 1.0e9;
++	double storeGBs = (double)gMVKXPS.attBytes  / secs / 1.0e9;   // store is ~100% of attachments
++	fprintf(stderr, "[mvk-passstats] per sec: attachments=%.0f | load=%.0f clear=%.0f dontcare=%.0f | store=%.0f storeDontCare=%.0f | memoryless=%.0f | depthAtt=%.0f depthReadable=%.0f depthUnknown=%.0f | tile traffic: load %.2f GB/s + store %.2f GB/s = %.2f GB/s\n",
++			gMVKXPS.attachments/secs, gMVKXPS.loads/secs, gMVKXPS.clears/secs, gMVKXPS.dontcares/secs,
++			gMVKXPS.stores/secs, gMVKXPS.storeDontCares/secs, gMVKXPS.memoryless/secs, gMVKXPS.depthAtt/secs, gMVKXPS.depthReadable/secs, gMVKXPS.depthUnknown/secs,
++			loadGBs, storeGBs, loadGBs + storeGBs);
++	memset(&gMVKXPS, 0, sizeof(gMVKXPS));
++	last = now;
++}
++
++
+ bool MVKAttachmentDescription::populateMTLRenderPassAttachmentDescriptor(MTLRenderPassAttachmentDescriptor* mtlAttDesc,
+ 																		 MVKRenderSubpass* subpass,
+ 																		 MVKImageView* attachment,
+@@ -816,6 +844,25 @@ static size_t getAttachmentCount(const MVKArrayRef<uint32_t> colorAttIdxs,
+ 
+ 	mtlAttDesc.loadAction = mtlLA;
+ 
++	if (mvkxPassStatsOn()) {	// MVKX
++		id<MTLTexture> psTex = mtlAttDesc.texture;
++		unsigned long long psBytes = 0;
++		if (psTex) {
++			// bits-per-pixel is not directly exposed here; approximate from the row bytes of
++			// a 1-pixel-wide view is not available either, so use 4 B/px for colour and 4 for
++			// depth32. Good enough for an order-of-magnitude bandwidth read.
++			psBytes = (unsigned long long)psTex.width * (unsigned long long)psTex.height * 4ull;
++		}
++		gMVKXPS.attBytes += psBytes;
++		if (mtlLA == MTLLoadActionLoad) { gMVKXPS.loadBytes += psBytes; }
++		gMVKXPS.attachments++;
++		if (isMemorylessAttachment) { gMVKXPS.memoryless++; }
++		if (mtlLA == MTLLoadActionLoad)          { gMVKXPS.loads++; }
++		else if (mtlLA == MTLLoadActionClear)    { gMVKXPS.clears++; }
++		else                                     { gMVKXPS.dontcares++; }
++		mvkxPassStatsTick();
++	}
++
+     // Use late-specified store actions and then set them later.
+     // That way, if we wind up doing a tessellated draw, we can set the store action to store then,
+     // and then when the render pass actually ends, we can use the true store action.
+@@ -850,7 +897,35 @@ static size_t getAttachmentCount(const MVKArrayRef<uint32_t> colorAttIdxs,
+ 	bool isMemorylessAttachment = attachment->getImage()->getMTLStorageMode() == MTLStorageModeMemoryless;
+ 	MTLStoreAction storeAction = getMTLStoreAction(subpass, isRenderingEntireAttachment, isMemorylessAttachment,
+ 												   hasResolveAttachment, canResolveFormat, isStencil, storeOverride);
++	// MVKX: on tile-based GPUs, writing back a depth buffer nothing can read is pure
++	// bandwidth waste. DXVK always asks for STORE because D3D11 cannot express discard.
++	if (mvkxDiscardDepthOn() && storeAction == MTLStoreActionStore &&
++		(isDepthFormat || isStencilFormat) && !hasResolveAttachment) {
++		// Ask Metal directly rather than the Vulkan usage flags (which are protected here):
++		// if the texture cannot be read by any shader, nothing can observe the stored depth.
++		// MTLTextureUsageUnknown means "could be anything", so it is NOT safe to discard.
++		id<MTLTexture> dsTex = attachment->getMTLTexture(0);
++		MTLTextureUsage dsUse = dsTex ? dsTex.usage : MTLTextureUsageUnknown;
++		gMVKXPS.depthAtt++;
++		if (dsUse == MTLTextureUsageUnknown) { gMVKXPS.depthUnknown++; }
++		else if (mvkIsAnyFlagEnabled(dsUse, (MTLTextureUsage)(MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite))) { gMVKXPS.depthReadable++; }
++		if (dsTex && dsUse != MTLTextureUsageUnknown &&
++			!mvkIsAnyFlagEnabled(dsUse, (MTLTextureUsage)(MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite))) {
++			storeAction = MTLStoreActionDontCare;
++		}
++	}
++
++	if (mvkxPassStatsOn()) {	// MVKX
++		if (storeAction == MTLStoreActionStore || storeAction == MTLStoreActionStoreAndMultisampleResolve) { gMVKXPS.stores++; }
++		else { gMVKXPS.storeDontCares++; }
++	}
++
+ 	if (isColorFormat) {
++		if (getenv("MVK_DIAG_LOG_STORE")) {	// MVKDIAG
++			fprintf(stderr, "[mvk-diag] storeAction color[%u] = %lu (loadOp=%d storeOp=%d entireAtt=%d memoryless=%d override=%d)\n",
++					caIdx, (unsigned long)storeAction, (int)_info.loadOp, (int)_info.storeOp,
++					(int)isRenderingEntireAttachment, (int)isMemorylessAttachment, (int)storeOverride);
++		}
+ 		[cmdEncoder->_mtlRenderEncoder setColorStoreAction: storeAction atIndex: caIdx];
+ 	} else if (isDepthFormat && !isStencil) {
+ 		[cmdEncoder->_mtlRenderEncoder setDepthStoreAction: (isDepthSwizzled ? MTLStoreActionDontCare : storeAction)];
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index 3aa44a4..588e6e1 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -425,6 +425,32 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	bool wasConverted = _spvConverter.convert(*pShaderConfig, conversionResult, shouldLogCode, shouldLogCode, shouldLogEstimatedGLSL);
+ 	addPerformanceInterval(getPerformanceStats().shaderCompilation.spirvToMSL, startTime);
+ 
++	{	// MVKDIAG: neutralise individual tonemapper inputs to find which one is arriving as zero.
++		// Pure diagnosis - the generated MSL is edited before it is compiled.
++		static const char* forceExp = nullptr; static const char* forceApply = nullptr; static bool init = false;
++		static const char* rawScene = nullptr;
++		if (!init) { forceExp = getenv("MVK_DIAG_FORCE_EXPOSURE"); forceApply = getenv("MVK_DIAG_FORCE_APPLY"); rawScene = getenv("MVK_DIAG_RAW_SCENE"); init = true; }
++		if (wasConverted && (forceExp || forceApply || rawScene)) {
++			std::string& msl = conversionResult.msl;
++			auto sub = [&msl](const std::string& from, const std::string& to) {
++				size_t n = 0, pos = 0;
++				while ((pos = msl.find(from, pos)) != std::string::npos) { msl.replace(pos, from.size(), to); pos += to.size(); n++; }
++				return n;
++			};
++			size_t n1 = 0, n2 = 0, n3 = 0;
++			if (forceExp)   { n1 = sub("EyeAdaptationBuffer._m0[0u].x", "1.0"); }
++			if (forceApply) { n2 = sub("SceneColorApplyParamaters._m0[0u].xyz", "float3(1.0)"); }
++			// Make the tonemapper output its raw scene sample: if that is still black, the texture it
++			// was handed is empty; if the scene appears, the fault is inside the tonemap maths.
++			if (rawScene && msl.find("EyeAdaptationBuffer") != std::string::npos &&
++				msl.find("ColorTexture.sample(ColorSampler") != std::string::npos) {
++				n3 = sub("    return out;\n",
++						 "    out.out_var_SV_Target0 = float4(ColorTexture.sample(ColorSampler, in.in_var_TEXCOORD0).xyz, 1.0);\n    return out;\n");
++			}
++			if (n1 || n2 || n3) { fprintf(stderr, "[mvk-diag] patched MSL: exposure=%zu applyParams=%zu rawScene=%zu\n", n1, n2, n3); }
++		}
++	}
++
+ 	const char* dumpDir = getMVKConfig().shaderDumpDir;
+ 	if (dumpDir && *dumpDir) {
+ 		char path[PATH_MAX];
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+index 406f4f8..5d9303a 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+@@ -200,6 +200,14 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToM
+ 		if (so.outIsUsedByShader && !containsMatching(other.shaderOutputs, so)) { return false; }
+ 	}
+ 
++	// The outputs are what the next stage reads, which is a requirement on this shader and not just
++	// a description of it: an output the next stage needs may have been added to the MSL even though
++	// nothing in this shader writes it. A library converted without that output cannot be reused for
++	// a pipeline that needs it, so the outputs have to match in both directions.
++	for (const auto& so : other.shaderOutputs) {
++		if ( !containsMatching(shaderOutputs, so) ) { return false; }
++	}
++
+     for (const auto& rb : resourceBindings) {
+         if (rb.resourceBinding.stage == options.entryPointStage &&
+ 			rb.outIsUsedByShader &&
