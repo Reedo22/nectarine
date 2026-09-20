@@ -1,7 +1,7 @@
 # Nectarine
 
 Running Windows games on Apple Silicon with a **free, open stack** — Wine + msync + DXVK
-+ a patched MoltenVK — on a MacBook Pro (M1 Pro) that was never meant for gaming.
++ a patched MoltenVK — on a MacBook Pro (M1 Pro)
 
 Tested on macOS 15.1.1, Apple M1 Pro. Everything here is x86-64 Wine under Rosetta 2.
 
