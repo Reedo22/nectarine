@@ -1,0 +1,30 @@
+From 8d038d8c9bc83126de8e8485560e6debfcd5f62e Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 18:57:44 -0400
+Subject: [PATCH 29/29] win32u: Avoid gettid() on macOS in the Vulkan signaller
+ worker.
+
+It is only used for log messages; use the Mach thread port number instead.
+---
+ dlls/win32u/vulkan.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 1c6c30d0e60..ba975d3f9ca 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -646,7 +646,11 @@ signal_op_complete:
+ 
+ static void *signaller_worker( void *arg )
+ {
++#ifdef __APPLE__
++    int unix_tid = pthread_mach_thread_np( pthread_self() );
++#else
+     int unix_tid = gettid();
++#endif
+     struct vulkan_device *device = arg;
+     struct semaphore *sem;
+     VkSemaphoreWaitInfo wait_info = { 0 };
+-- 
+2.43.0
+

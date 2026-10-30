@@ -1,0 +1,389 @@
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.h
+@@ -22,10 +22,37 @@
+ #include "MVKSmallVector.h"
+ #include <mutex>
+ #include <condition_variable>
++#include <memory>
++#include <atomic>
+ 
+ class MVKBuffer;
+ class MVKCommandBuffer;
+ class MVKCommandEncoder;
++
++/** A query index and the reset generation recorded by its encoding. */
++struct MVKQueryIndex {
++    uint32_t index;
++    uint64_t generation;
++};
++
++/** GPU progress marker shared by a batch of timestamp queries. */
++class MVKQueryAvailability : public std::enable_shared_from_this<MVKQueryAvailability> {
++public:
++    MVKQueryAvailability(id<MTLSharedEvent> event, uint64_t value,
++                         const std::shared_ptr<std::atomic<uint64_t>>& cpuTimestamp);
++    ~MVKQueryAvailability();
++    bool isAvailable() const;
++    uint64_t getTimestamp();
++    void wait();
++private:
++    id<MTLSharedEvent> _event;
++    MTLSharedEventListener* _listener = nil;
++    uint64_t _value;
++    std::shared_ptr<std::atomic<uint64_t>> _cpuTimestamp;
++    std::mutex _lock;
++    std::condition_variable _blocker;
++};
++
+ 
+ // The size of one query slot in bytes
+ #define kMVKQuerySlotSizeInBytes		sizeof(uint64_t)
+@@ -56,7 +83,12 @@
+     virtual void endQuery(uint32_t query, MVKCommandEncoder* cmdEncoder);
+ 
+     /** Finishes the specified queries and marks them as available. */
+-    virtual void finishQueries(MVKArrayRef<const uint32_t> queries);
++    void finishQueries(MVKArrayRef<const MVKQueryIndex> queries);
++
++    uint64_t getGeneration(uint32_t query);
++    virtual bool publishesTimestampResults() const { return false; }
++    void setAvailabilitySignal(MVKArrayRef<const MVKQueryIndex> queries,
++                               const std::shared_ptr<MVKQueryAvailability>& signal);
+ 
+ 	/** Resets the results and availability status of the specified queries. */
+ 	virtual void resetResults(uint32_t firstQuery, uint32_t queryCount, MVKCommandEncoder* cmdEncoder);
+@@ -101,10 +133,14 @@
+ 				 const VkQueryPoolCreateInfo* pCreateInfo,
+ 				 const uint32_t queryElementCount) : MVKVulkanAPIDeviceObject(device),
+                     _availability(pCreateInfo->queryCount, Initial),
++                    _generations(pCreateInfo->queryCount, 0),
++                    _availabilitySignals(pCreateInfo->queryCount),
+                     _queryElementCount(queryElementCount) {}
+ 
+ protected:
+ 	bool areQueriesHostAvailable(uint32_t firstQuery, uint32_t endQuery);
++    void refreshAvailability(uint32_t firstQuery, uint32_t endQuery);
++    virtual void finishResult(uint32_t query, uint64_t timestamp) {}
+ 	virtual NSData* getQuerySourceData(uint32_t firstQuery, uint32_t queryCount) { return nil; }
+     VkResult getResult(uint32_t query, NSData* srcData, uint32_t srcDataQueryOffset, void* pDstData, VkQueryResultFlags flags);
+ 	virtual id<MTLBuffer> getResultBuffer(MVKCommandEncoder* cmdEncoder, uint32_t firstQuery, uint32_t queryCount, NSUInteger& offset) { return nil; }
+@@ -129,6 +165,8 @@
+ 	};
+ 
+ 	MVKSmallVector<Status, kMVKDefaultQueryCount> _availability;
++    std::vector<uint64_t> _generations;
++    std::vector<std::shared_ptr<MVKQueryAvailability>> _availabilitySignals;
+ 	MVKSmallVector<DeferredCopy, 4> _deferredCopies;
+ 	uint32_t _queryElementCount;
+ 	std::mutex _availabilityLock;
+@@ -211,7 +249,7 @@
+ 
+ public:
+ 	void endQuery(uint32_t query, MVKCommandEncoder* cmdEncoder) override;
+-	void finishQueries(MVKArrayRef<const uint32_t> queries) override;
++	bool publishesTimestampResults() const override { return true; }
+ 
+ #pragma mark Construction
+ 
+@@ -219,6 +257,7 @@
+ 
+ protected:
+ 	void propagateDebugName() override {}
++    void finishResult(uint32_t query, uint64_t timestamp) override;
+ 	NSData* getQuerySourceData(uint32_t firstQuery, uint32_t queryCount) override;
+ 	id<MTLBuffer> getResultBuffer(MVKCommandEncoder* cmdEncoder, uint32_t firstQuery, uint32_t queryCount, NSUInteger& offset) override;
+ 	id<MTLComputeCommandEncoder> encodeComputeCopyResults(MVKCommandEncoder* cmdEncoder, uint32_t firstQuery, uint32_t queryCount, uint32_t index) override;
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueryPool.mm
+@@ -28,6 +28,42 @@
+ using namespace std;
+ 
+ 
++#pragma mark MVKQueryAvailability
++
++MVKQueryAvailability::MVKQueryAvailability(id<MTLSharedEvent> event, uint64_t value,
++                                         const std::shared_ptr<std::atomic<uint64_t>>& cpuTimestamp)
++    : _event([event retain]), _value(value), _cpuTimestamp(cpuTimestamp) {}
++
++MVKQueryAvailability::~MVKQueryAvailability() {
++    [_listener release];
++    [_event release];
++}
++
++bool MVKQueryAvailability::isAvailable() const { return _event.signaledValue >= _value; }
++
++uint64_t MVKQueryAvailability::getTimestamp() {
++    uint64_t timestamp = _cpuTimestamp->load();
++    if (!timestamp) {
++        uint64_t current = mvkGetElapsedNanoseconds();
++        if (_cpuTimestamp->compare_exchange_strong(timestamp, current)) { timestamp = current; }
++    }
++    return timestamp;
++}
++
++void MVKQueryAvailability::wait() {
++    unique_lock<mutex> lock(_lock);
++    if (isAvailable()) { return; }
++    if (!_listener) {
++        _listener = [MTLSharedEventListener new];
++        std::weak_ptr<MVKQueryAvailability> weak = shared_from_this();
++        [_event notifyListener: _listener atValue: _value block: ^(id<MTLSharedEvent> event, uint64_t value) {
++            if (auto signal = weak.lock()) { signal->_blocker.notify_all(); }
++        }];
++    }
++    // Periodically return so the query pool can notice device loss as well.
++    _blocker.wait_for(lock, chrono::milliseconds(10), [this] { return isAvailable(); });
++}
++
+ #pragma mark MVKQueryPool
+ 
+ void MVKQueryPool::endQuery(uint32_t query, MVKCommandEncoder* cmdEncoder) {
+@@ -51,15 +87,48 @@
+     }
+ }
+ 
+-// Mark queries as available
+-void MVKQueryPool::finishQueries(MVKArrayRef<const uint32_t> queries) {
++// Completion callbacks and GPU progress markers both publish under the same lock.
++// A callback from an earlier use must never publish a reset/reused query index.
++void MVKQueryPool::finishQueries(MVKArrayRef<const MVKQueryIndex> queries) {
+     lock_guard<mutex> lock(_availabilityLock);
+-    for (uint32_t qry : queries) {
+-        if (_availability[qry] == DeviceAvailable) {
+-            _availability[qry] = Available;
++    uint64_t timestamp = mvkGetElapsedNanoseconds();
++    for (auto query : queries) {
++        uint32_t index = query.index;
++        if (_generations[index] == query.generation && _availability[index] == DeviceAvailable) {
++            auto& signal = _availabilitySignals[index];
++            finishResult(index, signal ? signal->getTimestamp() : timestamp);
++            _availability[index] = Available;
++            signal.reset();
+         }
+     }
+-    _availabilityBlocker.notify_all();      // Predicate of each wait() call will check whether all required queries are available
++    _availabilityBlocker.notify_all();
++}
++
++uint64_t MVKQueryPool::getGeneration(uint32_t query) {
++    lock_guard<mutex> lock(_availabilityLock);
++    return _generations[query];
++}
++
++void MVKQueryPool::setAvailabilitySignal(MVKArrayRef<const MVKQueryIndex> queries,
++                                        const std::shared_ptr<MVKQueryAvailability>& signal) {
++    lock_guard<mutex> lock(_availabilityLock);
++    for (auto query : queries) {
++        if (_generations[query.index] == query.generation &&
++            _availability[query.index] == DeviceAvailable) {
++            _availabilitySignals[query.index] = signal;
++        }
++    }
++}
++
++void MVKQueryPool::refreshAvailability(uint32_t firstQuery, uint32_t endQuery) {
++    for (uint32_t query = firstQuery; query < endQuery; query++) {
++        auto& signal = _availabilitySignals[query];
++        if (_availability[query] == DeviceAvailable && signal && signal->isAvailable()) {
++            finishResult(query, signal->getTimestamp());
++            _availability[query] = Available;
++            signal.reset();
++        }
++    }
+ }
+ 
+ void MVKQueryPool::resetResults(uint32_t firstQuery, uint32_t queryCount, MVKCommandEncoder* cmdEncoder) {
+@@ -67,6 +136,8 @@
+     uint32_t endQuery = firstQuery + queryCount;
+     for (uint32_t query = firstQuery; query < endQuery; query++) {
+         _availability[query] = Initial;
++        ++_generations[query];
++        _availabilitySignals[query].reset();
+     }
+ }
+ 
+@@ -82,11 +153,26 @@
+ 
+ 	uint32_t endQuery = firstQuery + queryCount;
+ 
+-	if (mvkAreAllFlagsEnabled(flags, VK_QUERY_RESULT_WAIT_BIT)) {
+-		_availabilityBlocker.wait(lock, [this, firstQuery, endQuery]{
+-			return areQueriesHostAvailable(firstQuery, endQuery);
+-		});
+-	}
++    refreshAvailability(firstQuery, endQuery);
++    if (mvkAreAllFlagsEnabled(flags, VK_QUERY_RESULT_WAIT_BIT)) {
++        while (!areQueriesHostAvailable(firstQuery, endQuery)) {
++            std::shared_ptr<MVKQueryAvailability> signal;
++            for (uint32_t query = firstQuery; query < endQuery; query++) {
++                if (_availability[query] == DeviceAvailable && _availabilitySignals[query]) {
++                    signal = _availabilitySignals[query];
++                    break;
++                }
++            }
++            if (signal) {
++                lock.unlock();
++                signal->wait();
++                lock.lock();
++            } else {
++                _availabilityBlocker.wait(lock);
++            }
++            refreshAvailability(firstQuery, endQuery);
++        }
++    }
+ 
+ 	VkResult rqstRslt = VK_SUCCESS;
+ 	@autoreleasepool {
+@@ -342,13 +428,10 @@
+ 	MVKQueryPool::endQuery(query, cmdEncoder);
+ }
+ 
+-// If not using MTLCounterSampleBuffer, update timestamp values, then mark queries as available
+-void MVKTimestampQueryPool::finishQueries(MVKArrayRef<const uint32_t> queries) {
+-	if ( !_mtlCounterBuffer ) {
+-		uint64_t ts = mvkGetElapsedNanoseconds();
+-		for (uint32_t qry : queries) { _timestamps[qry] = ts; }
+-	}
+-	MVKQueryPool::finishQueries(queries);
++// The CPU fallback retains one completion time per Metal command buffer, as before.
++// Both early publication and the final callback finalize a query at most once.
++void MVKTimestampQueryPool::finishResult(uint32_t query, uint64_t timestamp) {
++    if (!_mtlCounterBuffer) { _timestamps[query] = timestamp; }
+ }
+ 
+ NSData* MVKTimestampQueryPool::getQuerySourceData(uint32_t firstQuery, uint32_t queryCount) {
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+@@ -235,7 +235,7 @@
+ #pragma mark MVKCommandEncoder
+ 
+ /*** Holds a collection of active queries for each query pool. */
+-typedef std::unordered_map<MVKQueryPool*, MVKSmallVector<uint32_t, kMVKDefaultQueryCount>> MVKActivatedQueries;
++typedef std::unordered_map<MVKQueryPool*, MVKSmallVector<MVKQueryIndex, kMVKDefaultQueryCount>> MVKActivatedQueries;
+ 
+ /** 
+  * MVKCommandEncoder uses a visitor design pattern iterate the commands in a MVKCommandBuffer, 
+@@ -533,6 +533,7 @@
+ protected:
+     void addActivatedQueries(MVKQueryPool* pQueryPool, uint32_t query, uint32_t queryCount);
+     void finishQueries();
++    void publishTimestampQueries();
+ 	void setSubpass(MVKCommand* passCmd, VkSubpassContents subpassContents, uint32_t subpassIndex, MVKCommandUse cmdUse);
+ 	void clearRenderArea(MVKCommandUse cmdUse);
+ 	bool hasMoreMultiviewPasses();
+@@ -554,6 +555,9 @@
+ 	VkRect2D _renderArea;
+ 	MVKCommand* _lastMultiviewPassCmd;
+     MVKActivatedQueries* _pActivatedQueries;
++    id<MTLSharedEvent> _queryAvailabilityEvent = nil;
++    uint64_t _queryAvailabilityValue = 0;
++    std::shared_ptr<std::atomic<uint64_t>> _queryAvailabilityCpuTimestamp;
+ 	MVKSmallVector<GPUCounterQuery, 16> _timestampStageCounterQueries;
+ 	MVKSmallVector<VkClearValue, kMVKDefaultAttachmentCount> _clearValues;
+ 	MVKSmallVector<MVKImageView*, kMVKDefaultAttachmentCount> _attachments;
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -1554,6 +1554,7 @@
+     _mtlBlitEncoderUse = kMVKCommandUseNone;
+ 
+ 	encodeTimestampStageCounterSamples();
++    publishTimestampQueries();
+ }
+ 
+ static MTLDispatchType getDispatchType(MVKCommandUse use) {
+@@ -1737,7 +1738,6 @@
+     if (isInRenderPass() && getSubpass()->isMultiview()) {
+         queryCount = getSubpass()->getViewCountInMetalPass(_multiviewPassIndex);
+     }
+-	addActivatedQueries(pQueryPool, query, queryCount);
+ 
+ 	if (pQueryPool->hasMTLCounterBuffer()) {
+ 		MVKCounterSamplingFlags sampPts = getMetalFeatures().counterSamplingPoints;
+@@ -1749,6 +1749,7 @@
+ 			}
+ 		}
+ 	}
++    addActivatedQueries(pQueryPool, query, queryCount);
+ }
+ 
+ // Metal stage GPU counters need to be configured in a Metal render, compute, or BLIT encoder, meaning that the
+@@ -1816,7 +1817,46 @@
+     if ( !_pActivatedQueries ) { _pActivatedQueries = new MVKActivatedQueries(); }
+     uint32_t endQuery = query + queryCount;
+     while (query < endQuery) {
+-        (*_pActivatedQueries)[pQueryPool].push_back(query++);
++        (*_pActivatedQueries)[pQueryPool].push_back({query, pQueryPool->getGeneration(query)});
++        ++query;
+     }
++}
++
++// Keep query pools alive until delayed Metal completion handlers release them.
++static std::shared_ptr<MVKActivatedQueries> mvkRetainQueryPools(MVKActivatedQueries* queries) {
++    for (auto& pair : *queries) { pair.first->retain(); }
++    return std::shared_ptr<MVKActivatedQueries>(queries, [](MVKActivatedQueries* retained) {
++        for (auto& pair : *retained) { pair.first->release(); }
++        delete retained;
++    });
++}
++
++// Native events can become visible while this Metal command buffer is still running.
++// Publish timestamp availability at the end of its sample encoders, so host query
++// reads do not depend on whole-command-buffer completion (which may wait on the host).
++void MVKCommandEncoder::publishTimestampQueries() {
++    if (!_pActivatedQueries) { return; }
++    auto* pending = new MVKActivatedQueries;
++    for (auto it = _pActivatedQueries->begin(); it != _pActivatedQueries->end();) {
++        if (it->first->publishesTimestampResults()) {
++            pending->emplace(it->first, std::move(it->second));
++            it = _pActivatedQueries->erase(it);
++        } else { ++it; }
++    }
++    if (pending->empty()) { delete pending; return; }
++    auto queries = mvkRetainQueryPools(pending);
++    if (!_queryAvailabilityEvent) {
++        _queryAvailabilityEvent = [getMTLDevice() newSharedEvent];
++        _queryAvailabilityCpuTimestamp = std::make_shared<std::atomic<uint64_t>>(0);
++    }
++    auto signal = std::make_shared<MVKQueryAvailability>(_queryAvailabilityEvent,
++                                                       ++_queryAvailabilityValue,
++                                                       _queryAvailabilityCpuTimestamp);
++    for (auto& pair : *queries) { pair.first->setAvailabilitySignal(pair.second.contents(), signal); }
++    [_mtlCmdBuffer encodeSignalEvent: _queryAvailabilityEvent value: _queryAvailabilityValue];
++    [_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer> buffer) {
++        for (auto& pair : *queries) { pair.first->finishQueries(pair.second.contents()); }
++        (void)signal; // Retain the internal event if the queries are reset before completion.
++    }];
+ }
+ 
+@@ -1132,14 +1132,11 @@
+ // Register a command buffer completion handler that finishes each activated query.
+ // Ownership of the collection of activated queries is passed to the handler.
+-void MVKCommandEncoder::finishQueries() {
+-    if ( !_pActivatedQueries ) { return; }
+-
+-    MVKActivatedQueries* pAQs = _pActivatedQueries;
+-    [_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer> mtlCmdBuff) {
+-        for (auto& qryPair : *pAQs) {
+-            qryPair.first->finishQueries(qryPair.second.contents());
+-        }
+-        delete pAQs;
+-    }];
+-    _pActivatedQueries = nullptr;
+-}
++void MVKCommandEncoder::finishQueries() {
++    if ( !_pActivatedQueries ) { return; }
++
++    auto queries = mvkRetainQueryPools(_pActivatedQueries);
++    _pActivatedQueries = nullptr;
++    [_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer> mtlCmdBuff) {
++        for (auto& pair : *queries) { pair.first->finishQueries(pair.second.contents()); }
++    }];
++}
+@@ -1858,6 +1887,7 @@
+ 	[_mtlRenderEncoder release];
+ 	[_mtlComputeEncoder release];
+ 	[_mtlBlitEncoder release];
++    [_queryAvailabilityEvent release];
+ 	// _stageCountersMTLFence is released after Metal command buffer completion
+ }
+ 

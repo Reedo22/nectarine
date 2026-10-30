@@ -1,0 +1,211 @@
+From b6a4c645880bb1d023ed2bc09b84fe87b452c74d Mon Sep 17 00:00:00 2001
+From: Reedo22 <141674188+Reedo22@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 17:58:03 -0400
+Subject: [PATCH] server, ntdll: Fix three macOS socket hangs.
+
+- send/recv on an unconnected stream socket: Linux poll() reports
+  POLLOUT|POLLHUP and the call fails with ENOTCONN; macOS reports nothing,
+  so the request waited forever. Fail it with STATUS_INVALID_CONNECTION.
+- recvmsg() into write-watched memory: XNU dequeues TCP data before
+  copying it out, so the EFAULT-then-retry path lost the data and the
+  overlapped recv never completed. On macOS resolve write watches first.
+- connect() after a failed connect(): a macOS TCP socket is dead after a
+  refused/failed connect (every retry fails with EISCONN). Put a fresh
+  unix socket with the same options and explicit bind under the same fd.
+  Clients cache a stream socket's fd only once it is connected, so none
+  holds the old one.
+
+ws2_32_test sock now runs to completion on macOS (2.67M checks, 146
+failures; it hung before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/virtual.c | 12 ++++-
+ server/sock.c             | 98 ++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 106 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 1246c126249..c1d56e52f84 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -5126,9 +5126,17 @@ ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags )
+     size_t i;
+     BOOL has_write_watch = FALSE;
+     int err = EFAULT;
++    ssize_t ret = -1;
+ 
+-    ssize_t ret = recvmsg( fd, hdr, flags );
+-    if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
++#ifdef __APPLE__
++    /* XNU dequeues TCP data before copying it out, so a recvmsg() that fails with EFAULT on a
++     * write-watched page has already lost the data; resolve write watches before the first try. */
++    if (use_kernel_writewatch)
++#endif
++    {
++        ret = recvmsg( fd, hdr, flags );
++        if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
++    }
+ 
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+     for (i = 0; i < hdr->msg_iovlen; i++)
+diff --git a/server/sock.c b/server/sock.c
+index 0337d8d3220..033d0703be8 100644
+--- a/server/sock.c
++++ b/server/sock.c
+@@ -299,6 +299,8 @@ struct sock
+     unsigned int        reset : 1;   /* did we get a TCP reset? */
+     unsigned int        reuseaddr : 1; /* winsock SO_REUSEADDR option value */
+     unsigned int        exclusiveaddruse : 1; /* winsock SO_EXCLUSIVEADDRUSE option value */
++    union unix_sockaddr user_bind_addr; /* unix address of an explicit bind() */
++    socklen_t           user_bind_len;  /* length of user_bind_addr, 0 if not explicitly bound */
+ };
+ 
+ static int is_tcp_socket( struct sock *sock )
+@@ -1436,6 +1438,7 @@ static void sock_poll_event( struct fd *fd, int event )
+         {
+             sock->state = SOCK_CONNECTED;
+             sock->connect_time = current_time;
++            allow_fd_caching( sock->fd );
+             sock->errors[AFD_POLL_BIT_CONNECT_ERR] = 0;
+         }
+         break;
+@@ -2531,6 +2534,84 @@ static struct accept_req *alloc_accept_req( struct sock *sock, struct sock *acce
+     return req;
+ }
+ 
++/* After a failed connect() a macOS stream socket stays unusable: every later connect() fails
++ * with EISCONN. Windows and Linux allow retrying on the same socket, so put a fresh unix socket
++ * with the same options (and explicit bind) under the same fd number. The fd is not cached by
++ * clients until the socket connects, so nobody holds the old one. */
++static int sock_renew_unix_fd( struct sock *sock, int unix_fd )
++{
++    static const struct { int level, name; } options[] =
++    {
++        { SOL_SOCKET, SO_REUSEADDR },
++#ifdef SO_REUSEPORT
++        { SOL_SOCKET, SO_REUSEPORT },
++#endif
++#ifdef SO_NOSIGPIPE
++        { SOL_SOCKET, SO_NOSIGPIPE },
++#endif
++        { SOL_SOCKET, SO_KEEPALIVE },
++        { SOL_SOCKET, SO_OOBINLINE },
++        { SOL_SOCKET, SO_DONTROUTE },
++        { SOL_SOCKET, SO_RCVBUF },
++        { SOL_SOCKET, SO_SNDBUF },
++        { IPPROTO_TCP, TCP_NODELAY },
++#ifdef TCP_KEEPALIVE
++        { IPPROTO_TCP, TCP_KEEPALIVE },
++#endif
++#ifdef TCP_KEEPINTVL
++        { IPPROTO_TCP, TCP_KEEPINTVL },
++#endif
++#ifdef TCP_KEEPCNT
++        { IPPROTO_TCP, TCP_KEEPCNT },
++#endif
++    };
++    union unix_sockaddr addr;
++    socklen_t len = sizeof(addr);
++    struct linger linger;
++    int new_fd, value;
++    unsigned int i;
++
++    if (sock->state != SOCK_UNCONNECTED) return -1;
++    if (getsockname( unix_fd, &addr.addr, &len ) < 0) return -1;
++    if (addr.addr.sa_family != AF_INET && addr.addr.sa_family != AF_INET6) return -1;
++    if ((new_fd = socket( addr.addr.sa_family, SOCK_STREAM, get_unix_protocol( sock->family, sock->proto ) )) < 0)
++        return -1;
++    fcntl( new_fd, F_SETFL, O_NONBLOCK );
++
++    for (i = 0; i < ARRAY_SIZE(options); i++)
++    {
++        len = sizeof(value);
++        if (!getsockopt( unix_fd, options[i].level, options[i].name, &value, &len ))
++            setsockopt( new_fd, options[i].level, options[i].name, &value, len );
++    }
++    len = sizeof(linger);
++    if (!getsockopt( unix_fd, SOL_SOCKET, SO_LINGER, &linger, &len ))
++        setsockopt( new_fd, SOL_SOCKET, SO_LINGER, &linger, len );
++    if (addr.addr.sa_family == AF_INET6)
++    {
++#ifdef IPV6_V6ONLY
++        len = sizeof(value);
++        if (!getsockopt( unix_fd, IPPROTO_IPV6, IPV6_V6ONLY, &value, &len ))
++            setsockopt( new_fd, IPPROTO_IPV6, IPV6_V6ONLY, &value, len );
++#endif
++        set_dont_fragment( new_fd, IPPROTO_IPV6, TRUE );
++    }
++    else set_dont_fragment( new_fd, IPPROTO_IP, TRUE );
++
++    /* dup2() closes the old socket, which drops its kqueue/epoll registration */
++    set_fd_events( sock->fd, -1 );
++    if (dup2( new_fd, unix_fd ) < 0)
++    {
++        close( new_fd );
++        sock_reselect( sock );
++        return -1;
++    }
++    close( new_fd );
++    if (sock->user_bind_len) bind( unix_fd, &sock->user_bind_addr.addr, sock->user_bind_len );
++    sock_reselect( sock );
++    return 0;
++}
++
+ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+ {
+     struct sock *sock = get_fd_user( fd );
+@@ -2758,6 +2839,8 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+              * sufficient. */
+             ret = connect( unix_fd, &unix_addr.addr, unix_len );
+         }
++        if (ret < 0 && errno == EISCONN && sock->type == WS_SOCK_STREAM && !sock_renew_unix_fd( sock, unix_fd ))
++            ret = connect( unix_fd, &unix_addr.addr, unix_len );
+ 
+         if (ret < 0 && errno == EACCES && sock->state == SOCK_CONNECTIONLESS && unix_addr.addr.sa_family == AF_INET)
+         {
+@@ -2784,8 +2867,9 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+             return;
+         }
+ 
+-        /* a connected or connecting socket can no longer be accepted into */
+-        allow_fd_caching( sock->fd );
++        /* a connected socket can no longer be accepted into; a connecting one may still fail and
++         * get a new unix socket (sock_renew_unix_fd), so it is only cached once connected */
++        if (!ret || sock->type != WS_SOCK_STREAM) allow_fd_caching( sock->fd );
+ 
+         unix_len = sizeof(unix_addr);
+         getsockname( unix_fd, &unix_addr.addr, &unix_len );
+@@ -3146,6 +3230,9 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+         unix_len = sizeof(bind_addr);
+         if (!getsockname( unix_fd, &bind_addr.addr, &unix_len ))
+         {
++            memcpy( &sock->user_bind_addr, &bind_addr, unix_len );
++            sock->user_bind_len = unix_len;
++
+             /* store the interface or magic loopback address instead of the
+              * actual unix address */
+             if (bind_addr.addr.sa_family == AF_INET)
+@@ -3999,6 +4086,9 @@ DECL_HANDLER(recv_socket)
+         status = STATUS_PIPE_DISCONNECTED;
+     else if (sock->reset)
+         status = STATUS_CONNECTION_RESET;
++    /* see send_socket: macOS never signals an unconnected stream socket */
++    else if (sock->type == WS_SOCK_STREAM && (sock->state == SOCK_UNCONNECTED || sock->state == SOCK_LISTENING))
++        status = STATUS_INVALID_CONNECTION;
+     else if (!async_queued( &sock->read_q ))
+     {
+         /* If read_q is not empty, we cannot really tell if the already queued
+@@ -4104,6 +4194,10 @@ DECL_HANDLER(send_socket)
+ 
+     if (bind_errno) status = sock_get_ntstatus( bind_errno );
+     else if (sock->wr_shutdown) status = STATUS_PIPE_DISCONNECTED;
++    /* Linux poll() reports POLLOUT|POLLHUP for a stream socket that is not connected, so the send
++     * fails with ENOTCONN; macOS reports nothing and the send would wait forever. */
++    else if (sock->type == WS_SOCK_STREAM && (sock->state == SOCK_UNCONNECTED || sock->state == SOCK_LISTENING))
++        status = STATUS_INVALID_CONNECTION;
+     else if (!async_queue_has_waiting_asyncs( &sock->write_q ))
+     {
+         /* If write_q is not empty, we cannot really tell if the already queued
+-- 
+2.43.0
+

@@ -1,0 +1,338 @@
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1076,6 +1076,11 @@
+ 
+     TRACE("%s\n", debugstr_client_surface(client));
+ 
++    if (surface->remote_layer)
++    {
++        macdrv_post_remote_layer(client->hwnd, FALSE, surface->remote_context_id);
++        macdrv_release_remote_metal_layer(surface->remote_layer);
++    }
+     if (surface->metal_view) macdrv_view_release_metal_view(surface->metal_view);
+     if (surface->metal_device) macdrv_release_metal_device(surface->metal_device);
+ }
+@@ -1145,6 +1150,11 @@
+     .update = macdrv_client_surface_update,
+     .present = macdrv_client_surface_present,
+ };
++
++void macdrv_post_remote_layer(HWND hwnd, BOOL create, unsigned int context_id)
++{
++    NtUserPostMessage(hwnd, create ? WM_MACDRV_CREATE_REMOTE_LAYER : WM_MACDRV_RELEASE_REMOTE_LAYER, 0, context_id);
++}
+ 
+ struct macdrv_client_surface *macdrv_client_surface_create(HWND hwnd)
+ {
+@@ -1532,9 +1542,39 @@
+     case WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS:
+         activate_on_following_focus();
+         TRACE("WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS time %u\n", activate_on_focus_time);
++        return 0;
++    case WM_MACDRV_CREATE_REMOTE_LAYER:
++    {
++        HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
++        RECT rect;
++
++        if ((data = get_win_data(toplevel)))
++        {
++            TRACE("WM_MACDRV_CREATE_REMOTE_LAYER hwnd %p context_id %u\n", hwnd, (unsigned int)lp);
++            if (data->cocoa_window && NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI)))
++            {
++                NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&rect, 2, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
++                OffsetRect(&rect, data->rects.client.left - data->rects.visible.left,
++                           data->rects.client.top - data->rects.visible.top);
++                macdrv_window_create_ca_layer_host_view(data->cocoa_window, (unsigned int)lp, cgrect_from_rect(rect));
++            }
++            release_win_data(data);
++        }
+         return 0;
+     }
++    case WM_MACDRV_RELEASE_REMOTE_LAYER:
++    {
++        HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+ 
++        if ((data = get_win_data(toplevel)))
++        {
++            if (data->cocoa_window) macdrv_window_release_ca_layer_host_view(data->cocoa_window, (unsigned int)lp);
++            release_win_data(data);
++        }
++        return 0;
++    }
++    }
++
+     FIXME("unrecognized window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (unsigned long)wp, lp);
+     return 0;
+ }
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -98,6 +98,8 @@
+ {
+     WM_MACDRV_SET_WIN_REGION = WM_WINE_FIRST_DRIVER_MSG,
+     WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS,
++    WM_MACDRV_CREATE_REMOTE_LAYER,
++    WM_MACDRV_RELEASE_REMOTE_LAYER,
+ };
+ 
+ struct macdrv_thread_data
+@@ -199,6 +201,8 @@
+     macdrv_view           cocoa_view;
+     macdrv_metal_device   metal_device;
+     macdrv_metal_view     metal_view;
++    void                 *remote_layer;   /* CAContext export of a layer hosted by another process's window */
++    unsigned int          remote_context_id;
+ };
+ 
+ static inline struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client)
+@@ -207,6 +211,7 @@
+ }
+ 
+ extern struct macdrv_client_surface *macdrv_client_surface_create(HWND hwnd);
++extern void macdrv_post_remote_layer(HWND hwnd, BOOL create, unsigned int context_id);
+ 
+ extern struct macdrv_win_data *get_win_data(HWND hwnd);
+ extern void release_win_data(struct macdrv_win_data *data);
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -531,6 +531,10 @@
+ extern macdrv_metal_view macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d);
+ extern macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v);
+ extern void macdrv_view_release_metal_view(macdrv_metal_view v);
++extern void *macdrv_create_remote_metal_layer(CGRect bounds, unsigned int *context_id, macdrv_metal_layer *layer);
++extern void macdrv_release_remote_metal_layer(void *remote);
++extern void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int context_id, CGRect frame);
++extern void macdrv_window_release_ca_layer_host_view(macdrv_window w, unsigned int context_id);
+ extern bool macdrv_get_view_backing_size(macdrv_view v, int backing_size[2]);
+ extern void macdrv_set_view_backing_size(macdrv_view v, const int backing_size[2]);
+ extern uint32_t macdrv_window_background_color(void);
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -4120,5 +4120,105 @@
+         }
+         if (window)
+             [[window contentView] clearMarkedText];
++    });
++}
++
++
++/* Nectarine: a GPU process (Chromium/CEF) presenting to a window owned by another process.
++ * The renderer exports a CAMetalLayer through a CAContext; the window's owner hosts it with a
++ * CALayerHost sublayer (same mechanism CrossOver uses for its remote swapchains). */
++typedef uint32_t CGSConnectionID;
++extern CGSConnectionID CGSMainConnectionID(void);
++typedef uint32_t CAContextID;
++
++@interface CAContext : NSObject
+++ (id) contextWithCGSConnection:(CGSConnectionID)connection options:(NSDictionary*)options;
++@property(readonly) CAContextID contextId;
++@property(retain) CALayer* layer;
++@end
++
++@interface CALayerHost : CALayer
++- (void) setContextId:(CAContextID)contextId;
++@end
++
++@interface NectarineRemoteMetal : NSObject
++{
++@public
++    CAContext *context;
++    CAMetalLayer *layer;
++    macdrv_metal_device device;
++}
++@end
++@implementation NectarineRemoteMetal
++@end
++
++void *macdrv_create_remote_metal_layer(CGRect bounds, unsigned int *context_id, macdrv_metal_layer *layer_out)
++{
++    __block NectarineRemoteMetal *r = [[NectarineRemoteMetal alloc] init];
++
++    r->device = macdrv_create_metal_device();
++    OnMainThread(^{
++        r->layer = [[CAMetalLayer alloc] init];
++        r->layer.device = (id<MTLDevice>)r->device;
++        r->layer.framebufferOnly = YES;
++        r->layer.magnificationFilter = kCAFilterNearest;
++        r->layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
++        r->layer.contentsScale = retina_on ? 2.0 : 1.0;
++        r->layer.bounds = bounds;
++        r->layer.anchorPoint = CGPointMake(0, 0);
++        r->context = [[CAContext contextWithCGSConnection:CGSMainConnectionID() options:[NSDictionary dictionary]] retain];
++        [r->context setLayer:r->layer];
++    });
++    if (!r->context || ![r->context contextId])
++    {
++        macdrv_release_remote_metal_layer(r);
++        return NULL;
++    }
++    *context_id = [r->context contextId];
++    *layer_out = (macdrv_metal_layer)r->layer;
++    return r;
++}
++
++void macdrv_release_remote_metal_layer(void *remote)
++{
++    NectarineRemoteMetal *r = remote;
++    OnMainThreadAsync(^{
++        [r->context setLayer:nil];
++        [r->context release];
++        [r->layer release];
++        if (r->device) macdrv_release_metal_device(r->device);
++        [r release];
+     });
+ }
++
++static NSMutableDictionary *nectarine_layer_hosts;
++
++void macdrv_window_create_ca_layer_host_view(macdrv_window w, unsigned int context_id, CGRect frame)
++{
++    WineWindow *window = (WineWindow*)w;
++
++    OnMainThread(^{
++        CALayerHost *host;
++        NSView *view = window.contentView;
++
++        if (!nectarine_layer_hosts) nectarine_layer_hosts = [[NSMutableDictionary alloc] init];
++        [[nectarine_layer_hosts objectForKey:@(context_id)] removeFromSuperlayer];
++        host = [CALayerHost layer];
++        [host setContextId:context_id];
++        host.magnificationFilter = kCAFilterNearest;
++        host.contentsScale = retina_on ? 2.0 : 1.0;
++        host.frame = frame;
++        host.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
++        [view.layer addSublayer:host];
++        [nectarine_layer_hosts setObject:host forKey:@(context_id)];
++        [window windowDidDrawContent];
++    });
++}
++
++void macdrv_window_release_ca_layer_host_view(macdrv_window w, unsigned int context_id)
++{
++    OnMainThread(^{
++        [[nectarine_layer_hosts objectForKey:@(context_id)] removeFromSuperlayer];
++        [nectarine_layer_hosts removeObjectForKey:@(context_id)];
++    });
++}
+--- a/dlls/winemac.drv/vulkan.c
++++ b/dlls/winemac.drv/vulkan.c
+@@ -51,9 +51,30 @@
+ 
+     TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
+ 
++    macdrv_metal_layer layer;
++    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
++    DWORD owner_pid = 0;
++
+     if (!(surface = macdrv_client_surface_create(hwnd))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+-    if (!(surface->metal_device = macdrv_create_metal_device())) goto err;
+-    if (!(surface->metal_view = macdrv_view_create_metal_view(surface->cocoa_view, surface->metal_device))) goto err;
++    NtUserGetWindowThread(toplevel, &owner_pid);
++    if (owner_pid && owner_pid != HandleToULong(NtCurrentTeb()->ClientId.UniqueProcess))
++    {
++        /* Window of another process (CEF GPU process -> browser window): no Cocoa window here to
++         * attach a view to; export the layer and let the owner host it. */
++        RECT rect;
++        CGRect bounds;
++        NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++        bounds = CGRectMake(0, 0, rect.right - rect.left, rect.bottom - rect.top);
++        if (!(surface->remote_layer = macdrv_create_remote_metal_layer(bounds, &surface->remote_context_id, &layer))) goto err;
++        macdrv_post_remote_layer(hwnd, TRUE, surface->remote_context_id);
++        TRACE("remote layer for foreign window %p ctx %u\n", hwnd, surface->remote_context_id);
++    }
++    else
++    {
++        if (!(surface->metal_device = macdrv_create_metal_device())) goto err;
++        if (!(surface->metal_view = macdrv_view_create_metal_view(surface->cocoa_view, surface->metal_device))) goto err;
++        layer = macdrv_view_get_metal_layer(surface->metal_view);
++    }
+ 
+     if (instance->p_vkCreateMetalSurfaceEXT)
+     {
+@@ -61,7 +82,7 @@
+         create_info_host.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
+         create_info_host.pNext = NULL;
+         create_info_host.flags = 0; /* reserved */
+-        create_info_host.pLayer = macdrv_view_get_metal_layer(surface->metal_view);
++        create_info_host.pLayer = layer;
+ 
+         res = instance->p_vkCreateMetalSurfaceEXT(instance->host.instance, &create_info_host, NULL /* allocator */, handle);
+     }
+@@ -71,7 +92,7 @@
+         create_info_host.sType = VK_STRUCTURE_TYPE_MACOS_SURFACE_CREATE_INFO_MVK;
+         create_info_host.pNext = NULL;
+         create_info_host.flags = 0; /* reserved */
+-        create_info_host.pView = macdrv_view_get_metal_layer(surface->metal_view);
++        create_info_host.pView = layer;
+ 
+         res = instance->p_vkCreateMacOSSurfaceMVK(instance->host.instance, &create_info_host, NULL /* allocator */, handle);
+     }
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -2172,12 +2172,50 @@
+     struct startup_info_data *info;
+     DWORD size;
+     void *ptr;
++    DWORD cmdline_len = params->CommandLine.Length;
++    WCHAR *cmdline_ext_buf = NULL;
++
++    /* Nectarine: NECTARINE_CEF_ARGS appends Chromium switches to the Steam web helper browser process
++     * (Steam only forwards its own fixed -cef-* options); Chromium propagates them to its children. */
++    {
++        const char *extra = getenv( "NECTARINE_CEF_ARGS" );
++        if (extra && *extra && nt_image && nt_image->Buffer)
++        {
++            static const char webhelper[] = "steamwebhelper.exe";
++            const WCHAR *img = nt_image->Buffer, *cl_str = get_params_string( params, &params->CommandLine );
++            SIZE_T n = nt_image->Length / sizeof(WCHAR), i, k, elen = strlen( extra ), cl = params->CommandLine.Length / sizeof(WCHAR);
++            BOOL is_helper = FALSE, has_type = FALSE;
++            WCHAR *q;
+ 
++            for (i = 0; i + 18 <= n && !is_helper; i++)
++            {
++                for (k = 0; k < 18; k++)
++                {
++                    WCHAR c = img[i + k];
++                    if (c >= 'A' && c <= 'Z') c += 32;
++                    if (c != (WCHAR)webhelper[k]) break;
++                }
++                is_helper = (k == 18);
++            }
++            for (i = 0; i + 7 <= cl && !has_type; i++)
++                has_type = cl_str[i] == '-' && cl_str[i + 1] == '-' && cl_str[i + 2] == 't' && cl_str[i + 3] == 'y' &&
++                           cl_str[i + 4] == 'p' && cl_str[i + 5] == 'e' && cl_str[i + 6] == '=';
++            if (is_helper && !has_type && (cmdline_ext_buf = malloc( (cl + elen + 2) * sizeof(WCHAR) )))
++            {
++                memcpy( cmdline_ext_buf, cl_str, cl * sizeof(WCHAR) );
++                q = cmdline_ext_buf + cl;
++                *q++ = ' ';
++                for (i = 0; i < elen; i++) *q++ = (unsigned char)extra[i];
++                cmdline_len = (q - cmdline_ext_buf) * sizeof(WCHAR);
++            }
++        }
++    }
++
+     size = sizeof(*info);
+     size += params->CurrentDirectory.DosPath.Length;
+     size += params->DllPath.Length;
+     size += nt_image->Length;
+-    size += params->CommandLine.Length;
++    size += cmdline_len;
+     size += params->WindowTitle.Length;
+     size += params->Desktop.Length;
+     size += params->ShellInfo.Length;
+@@ -2216,7 +2254,14 @@
+     info->curdir_len = append_string( &ptr, params, &params->CurrentDirectory.DosPath );
+     info->dllpath_len = append_string( &ptr, params, &params->DllPath );
+     info->imagepath_len = append_string( &ptr, params, nt_image );
+-    info->cmdline_len = append_string( &ptr, params, &params->CommandLine );
++    if (cmdline_ext_buf)
++    {
++        memcpy( ptr, cmdline_ext_buf, cmdline_len );
++        ptr = (WCHAR *)ptr + cmdline_len / sizeof(WCHAR);
++        info->cmdline_len = cmdline_len;
++        free( cmdline_ext_buf );
++    }
++    else info->cmdline_len = append_string( &ptr, params, &params->CommandLine );
+     info->title_len = append_string( &ptr, params, &params->WindowTitle );
+     info->desktop_len = append_string( &ptr, params, &params->Desktop );
+     info->shellinfo_len = append_string( &ptr, params, &params->ShellInfo );

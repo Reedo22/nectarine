@@ -1,0 +1,25 @@
+From 8d800775d165a44e8c6e0dc6b52c24c51a3ceec5 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 12:51:18 -0400
+Subject: [PATCH 03/29] winegstreamer: Include pthread.h in media-converter.h.
+
+glibc pulls it in transitively; macOS does not.
+---
+ dlls/winegstreamer/media-converter/media-converter.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/dlls/winegstreamer/media-converter/media-converter.h b/dlls/winegstreamer/media-converter/media-converter.h
+index 3dd8864d54f..f5e6a5225dd 100644
+--- a/dlls/winegstreamer/media-converter/media-converter.h
++++ b/dlls/winegstreamer/media-converter/media-converter.h
+@@ -28,6 +28,7 @@
+ #include <inttypes.h>
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <pthread.h>
+ #include <sys/stat.h>
+ 
+ #include "unix_private.h"
+-- 
+2.43.0
+

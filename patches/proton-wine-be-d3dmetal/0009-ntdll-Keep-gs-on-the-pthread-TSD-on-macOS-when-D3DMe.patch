@@ -1,0 +1,713 @@
+From 2ff0b1236767277d305acefec6a88f0a3cd9ce93 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Mon, 26 Oct 2026 16:31:20 -0400
+Subject: [PATCH 09/11] ntdll: Keep %gs on the pthread TSD on macOS when
+ D3DMetal is active.
+
+Apple's D3DMetal PE DLLs call straight into libd3dshared.dylib on Windows threads, where macOS
+libpthread reads its TSD through %gs. Our Wine points gsbase at the TEB in PE code, so the first
+pthread call there faults (pthread_setname_np from D3DRMDispatch_Init). With
+CX_ACTIVE_GRAPHICS_BACKEND=d3dmetal, use CrossOver's model instead: gsbase never moves; TEB Self,
+ThreadLocalStoragePointer and Peb are mirrored into the TSD; TLS vector changes and TlsExpansionSlots
+keep the mirror in sync (CrossOver 18756); the dispatchers reach the TEB through %gs:0x30, which works
+in both modes, and skip every _thread_set_tsd_base swap. Without the variable nothing changes.
+Mostly written by Codex (interrupted twice), reviewed and squashed.
+---
+ dlls/ntdll/loader.c             |  48 +++++++
+ dlls/ntdll/unix/loader.c        |  17 ++-
+ dlls/ntdll/unix/signal_x86_64.c |  71 ++++++++++-
+ dlls/ntdll/unix/thread.c        |   3 +
+ dlls/ntdll/unix/unix_private.h  |   5 +
+ dlls/ntdll/unix/virtual.c       |  23 +++-
+ tools/gsbase-probe.c            | 216 ++++++++++++++++++++++++++++++++
+ tools/gsbase-tls.c              |  24 ++++
+ 8 files changed, 401 insertions(+), 6 deletions(-)
+ create mode 100644 tools/gsbase-probe.c
+ create mode 100644 tools/gsbase-tls.c
+
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index 27ad53376f2..19d21ba2341 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -1734,6 +1734,36 @@ static NTSTATUS alloc_thread_tls(void)
+     }
+     ++tls_thread_count;
+     NtCurrentTeb()->ThreadLocalStoragePointer = pointers;
++#if defined(__x86_64__) && !defined(__arm64ec__)
++    /* macOS pthread gsbase mode records the TSD mirror in Instrumentation[0]. */
++    if (NtCurrentTeb()->Instrumentation[0])
++        ((TEB *)NtCurrentTeb()->Instrumentation[0])->ThreadLocalStoragePointer = pointers;
++#endif
++    return STATUS_SUCCESS;
++}
++
++
++/*************************************************************************
++ *              alloc_thread_tls_expansion
++ *
++ * CrossOver 18756: native code may access dynamic TLS directly through %gs.
++ * Keep the expansion array at the same offset in the pthread TSD. Inline
++ * TlsSlots cannot be mirrored because they overlap pthread's own slots.
++ */
++static NTSTATUS alloc_thread_tls_expansion(void)
++{
++#if defined(__x86_64__) && !defined(__arm64ec__)
++    TEB *teb = NtCurrentTeb();
++
++    if (teb->Instrumentation[0] && !teb->WowTebOffset)
++    {
++        if (!teb->TlsExpansionSlots &&
++            !(teb->TlsExpansionSlots = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY,
++                                        8 * sizeof(teb->Peb->TlsExpansionBitmapBits) * sizeof(void *) )))
++            return STATUS_NO_MEMORY;
++        ((TEB *)teb->Instrumentation[0])->TlsExpansionSlots = teb->TlsExpansionSlots;
++    }
++#endif
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -4200,12 +4230,20 @@ void WINAPI LdrShutdownThread(void)
+     if ((pointers = NtCurrentTeb()->ThreadLocalStoragePointer))
+     {
+         NtCurrentTeb()->ThreadLocalStoragePointer = NULL;
++#if defined(__x86_64__) && !defined(__arm64ec__)
++        if (NtCurrentTeb()->Instrumentation[0])
++            ((TEB *)NtCurrentTeb()->Instrumentation[0])->ThreadLocalStoragePointer = NULL;
++#endif
+         --tls_thread_count;
+         for (i = 0; i < tls_module_count; i++) free_tls_memory( pointers[i] );
+         free_tls_memory( pointers );
+     }
+     RtlProcessFlsData( NtCurrentTeb()->FlsSlots, 2 );
+     NtCurrentTeb()->FlsSlots = NULL;
++#if defined(__x86_64__) && !defined(__arm64ec__)
++    if (NtCurrentTeb()->Instrumentation[0] && !NtCurrentTeb()->WowTebOffset)
++        ((TEB *)NtCurrentTeb()->Instrumentation[0])->TlsExpansionSlots = NULL;
++#endif
+     RtlFreeHeap( GetProcessHeap(), 0, NtCurrentTeb()->TlsExpansionSlots );
+     NtCurrentTeb()->TlsExpansionSlots = NULL;
+     RtlReleasePebLock();
+@@ -4705,6 +4743,13 @@ void loader_init( CONTEXT *context, void **entry )
+         /* TLS index 0 is always reserved, and wow64 reserves extra TLS entries */
+         RtlSetBits( peb->TlsBitmap, 0, NtCurrentTeb()->WowTebOffset ? WOW64_TLS_MAX_NUMBER : 1 );
+         RtlSetBits( peb->TlsBitmap, NTDLL_TLS_ERRNO, 1 );
++#if defined(__x86_64__) && !defined(__arm64ec__)
++        /* CrossOver 18756: force TlsAlloc() to use the mirrored expansion array. */
++        if (NtCurrentTeb()->Instrumentation[0] && !NtCurrentTeb()->WowTebOffset)
++            RtlSetBits( peb->TlsBitmap, 0, TLS_MINIMUM_AVAILABLE );
++#endif
++        if ((status = alloc_thread_tls_expansion()))
++            NtTerminateProcess( GetCurrentProcess(), status );
+ 
+         if (!(tls_dirs = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY, tls_module_count * sizeof(*tls_dirs) )))
+             NtTerminateProcess( GetCurrentProcess(), STATUS_NO_MEMORY );
+@@ -4766,6 +4811,9 @@ void loader_init( CONTEXT *context, void **entry )
+         arm64ec_thread_init();
+ #endif
+ 
++        if ((status = alloc_thread_tls_expansion()))
++            NtTerminateThread( GetCurrentThread(), status );
++
+         if (NtCurrentTeb()->SkipThreadAttach)
+         {
+             RtlLeaveCriticalSection( &loader_section );
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index c7b903fc768..0b395be2b3a 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -134,6 +134,11 @@ const char **system_dll_paths = NULL;
+ const char *user_name = NULL;
+ SECTION_IMAGE_INFORMATION main_image_info = { NULL };
+ 
++#if defined(__APPLE__) && defined(__x86_64__)
++/* Selected once in __wine_main(), before any Wine thread enters PE code. */
++BOOL use_macos_pthread_gsbase;
++#endif
++
+ /* die on a fatal error; use only during initialization */
+ static void fatal_error( const char *err, ... )
+ {
+@@ -1325,13 +1330,12 @@ static BOOL sonoma_or_later(void)
+ 
+ static void init_non_native_support(void)
+ {
+-    const char *backend = getenv( "CX_ACTIVE_GRAPHICS_BACKEND" );
+     const char *libd3dshared_path = getenv( "CX_APPLEGPTK_LIBD3DSHARED_PATH" );
+ 
+     register_non_native_code_region = NULL;
+     supports_non_native_code_regions = NULL;
+ 
+-    if (!backend || strcmp( backend, "d3dmetal" ) || !libd3dshared_path || !*libd3dshared_path ||
++    if (!use_macos_pthread_gsbase || !libd3dshared_path || !*libd3dshared_path ||
+         !sonoma_or_later())
+         return;
+ 
+@@ -2883,6 +2887,15 @@ DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
+     main_argc = argc;
+     main_argv = argv;
+ 
++#if defined(__APPLE__) && defined(__x86_64__)
++    {
++        const char *backend = getenv( "CX_ACTIVE_GRAPHICS_BACKEND" );
++
++        /* Select once, before creating any Wine threads or entering PE code. */
++        use_macos_pthread_gsbase = backend && !strcmp( backend, "d3dmetal" );
++    }
++#endif
++
+     init_paths();
+     if (!getenv( "WINELOADERNOEXEC" ) || argc <= 1) check_command_line( argc, argv );
+     unsetenv( "WINELOADERNOEXEC" );
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 931ed837395..2d46b0cb729 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -520,6 +520,9 @@ struct amd64_thread_data
+     DWORD                 fs;            /* 0338 WOW TEB selector */
+     DWORD                 mxcsr;         /* 033c Unix-side mxcsr register */
+     char                  syscall_dispatch; /* 0340 */
++#ifdef __APPLE__
++    BYTE                  pthread_gsbase; /* 0341 keep pthread TSD in %gs in PE code */
++#endif
+ };
+ 
+ C_ASSERT( sizeof(struct amd64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+@@ -529,6 +532,9 @@ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, ins
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, fs ) == 0x338 );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, mxcsr ) == 0x33c );
+ C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, syscall_dispatch ) == 0x340 );
++#ifdef __APPLE__
++C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct amd64_thread_data, pthread_gsbase ) == 0x341 );
++#endif
+ 
+ static inline struct amd64_thread_data *amd64_thread_data(void)
+ {
+@@ -933,7 +939,7 @@ static inline ucontext_t *init_handler( void *sigcontext )
+ #elif defined __APPLE__
+     {
+         struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&get_current_teb()->GdiTebBatch;
+-        _thread_set_tsd_base( (uint64_t)thread_data->pthread_teb );
++        if (!use_macos_pthread_gsbase) _thread_set_tsd_base( (uint64_t)thread_data->pthread_teb );
+ 
+         /* When in a syscall, CS will be the kernel's selector (0x07, SYSCALL_CS in xnu source)
+          * instead of the user selector (cs64_sel: 0x2b, USER64_CS).
+@@ -963,7 +969,7 @@ static inline void leave_handler( ucontext_t *sigcontext )
+         if (fs32_sel) __asm__ volatile( "movw %0,%%fs" :: "r" (fs32_sel) );
+     }
+ #elif defined __APPLE__
+-    if (!is_inside_signal_stack( (void *)RSP_sig(sigcontext )) &&
++    if (!use_macos_pthread_gsbase && !is_inside_signal_stack( (void *)RSP_sig(sigcontext )) &&
+         !is_inside_syscall( RSP_sig(sigcontext )))
+         _thread_set_tsd_base( (uint64_t)NtCurrentTeb() );
+ #endif
+@@ -1846,12 +1852,15 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
+                    "movw %ax,%fs\n"
+                    "1:\n\t"
+ #elif defined __APPLE__
++                   "cmpb $0,0x341(%r13)\n\t"   /* amd64_thread_data()->pthread_gsbase */
++                   "jne 1f\n\t"
+                    "movq %rcx,%r10\n\t"
+                    "movq %r13,%rdi\n\t"
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"  /* _thread_set_tsd_base */
+                    "syscall\n\t"
+                    "movq %r10,%rcx\n\t"
++                   "1:\n\t"
+ #endif
+                    "movq 0x330(%r13),%r10\n\t" /* amd64_thread_data()->instrumentation_callback */
+                    "movq (%r10),%r10\n\t"
+@@ -2444,6 +2453,8 @@ static inline BOOL check_invalid_gsbase( ucontext_t *ucontext )
+ #elif defined(__NetBSD__)
+     sysarch( X86_64_GET_GSBASE, &cur_gsbase );
+ #elif defined(__APPLE__)
++    /* A fault through the pthread TSD is not repaired by retrying with a TEB gsbase. */
++    if (use_macos_pthread_gsbase) return FALSE;
+     /* init_handler() has already reset GSBASE, we can't determine what it was before the signal */
+ #endif
+ 
+@@ -2950,6 +2961,9 @@ NTSTATUS signal_alloc_thread( TEB *teb )
+         else thread_data->fs = fs32_sel;
+     }
+     thread_data->frame_size = frame_size;
++#ifdef __APPLE__
++    thread_data->pthread_gsbase = use_macos_pthread_gsbase;
++#endif
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -3133,6 +3147,24 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend,
+     sysarch( X86_64_SET_GSBASE, &teb );
+ #elif defined (__APPLE__)
+     thread_data->pthread_teb = mac_thread_gsbase();
++    if (use_macos_pthread_gsbase)
++    {
++        TEB *pthread_teb = thread_data->pthread_teb;
++
++        if (!pthread_teb)
++        {
++            ERR( "could not obtain the pthread TSD for D3DMetal\n" );
++            abort_thread(1);
++        }
++        /* CrossOver's macOS model: never move %gs away from pthread's TSD.
++         * Only these Windows fields can be overlaid on its reserved slots. */
++        pthread_teb->Tib.Self = teb->Tib.Self;
++        pthread_teb->ThreadLocalStoragePointer = teb->ThreadLocalStoragePointer;
++        pthread_teb->Peb = teb->Peb;
++        /* The PE loader and virtual_set_tls_information_teb() update this mirror. */
++        teb->Instrumentation[0] = pthread_teb;
++        TRACE_(seh)( "using pthread gsbase %p for teb %p\n", pthread_teb, teb );
++    }
+ #else
+ # error Please define setting %gs for your architecture
+ #endif
+@@ -3253,7 +3285,13 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
+  */
+ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_gs_load") ":\n\t"
++#ifdef __APPLE__
++                   /* The TEB self pointer works with both TEB and pthread gsbase. */
++                   "movq %gs:0x30,%rcx\n\t"
++                   "movq 0x378(%rcx),%rcx\n\t"     /* thread_data->syscall_frame */
++#else
+                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
++#endif
+                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
+@@ -3339,7 +3377,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    __ASM_CFI(".cfi_undefined %rdi\n\t")
+                    __ASM_CFI(".cfi_undefined %rsi\n\t")
+                    /* When on the kernel stack, use %r13 instead of %gs to access the TEB.
+-                    * (on macOS, signal handlers set gsbase to pthread_teb when on the kernel stack).
++                    * On macOS, %gs addresses pthread's TSD here (and in PE code in D3DMetal mode).
+                     */
+ #ifdef __linux__
+                    "movb $0,0x340(%r13)\n\t"       /* amd64_thread_data()->syscall_dispatch */
+@@ -3356,11 +3394,14 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "leaq -0x98(%rbp),%rcx\n"
+                    "2:\n\t"
+ #elif defined __APPLE__
++                   "cmpb $0,0x341(%r13)\n\t"      /* amd64_thread_data()->pthread_gsbase */
++                   "jne 1f\n\t"
+                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+                    "syscall\n\t"
+                    "leaq -0x98(%rbp),%rcx\n"
++                   "1:\n\t"
+ #endif
+                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+                    "movl 0xb0(%rcx),%eax\n\t"      /* frame->syscall_id */
+@@ -3409,6 +3450,8 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "movw %dx,%fs\n"
+                    "1:\n\t"
+ #elif defined __APPLE__
++                   "cmpb $0,0x341(%r13)\n\t"      /* amd64_thread_data()->pthread_gsbase */
++                   "jne 1f\n\t"
+                    "movq %rax,%r8\n\t"
+                    "movq %rcx,%rdx\n\t"
+                    "movq %r13,%rdi\n\t"            /* teb */
+@@ -3417,6 +3460,7 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "syscall\n\t"
+                    "movq %rdx,%rcx\n\t"
+                    "movq %r8,%rax\n\t"
++                   "1:\n\t"
+ #endif
+                    "movl 0xb4(%rcx),%edx\n\t"      /* frame->restore_flags */
+                    "testl $0x48,%edx\n\t"          /* CONTEXT_FLOATING_POINT | CONTEXT_XSTATE */
+@@ -3505,7 +3549,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "popfq\n\t"
+                    "iretq\n"
+                    /* RESTORE_FLAGS_INSTRUMENTATION */
++#ifdef __APPLE__
++                   "2:\tmovq %gs:0x30,%r10\n\t"
++                   "movq 0x330(%r10),%r10\n\t"    /* amd64_thread_data()->instrumentation_callback */
++#else
+                    "2:\tmovq %gs:0x330,%r10\n\t"  /* amd64_thread_data()->instrumentation_callback */
++#endif
+                    "movq (%r10),%r10\n\t"
+                    "test %r10,%r10\n\t"
+                    "jz 3b\n\t"
+@@ -3564,7 +3613,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
+                    "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
+ 
+ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
++#ifdef __APPLE__
++                   "movq %gs:0x30,%rcx\n\t"
++                   "movq 0x378(%rcx),%rcx\n\t"     /* thread_data->syscall_frame */
++#else
+                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
++#endif
+                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
+@@ -3582,7 +3636,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
+ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "movq %rcx,%r10\n\t"
+                    __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_gs_load") ":\n\t"
++#ifdef __APPLE__
++                   "movq %gs:0x30,%rcx\n\t"
++                   "movq 0x378(%rcx),%rcx\n\t"     /* thread_data->syscall_frame */
++#else
+                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
++#endif
+                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
+@@ -3646,10 +3705,13 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "syscall\n\t"
+                    "2:\n\t"
+ #elif defined __APPLE__
++                   "cmpb $0,0x341(%r13)\n\t"      /* amd64_thread_data()->pthread_gsbase */
++                   "jne 1f\n\t"
+                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+                    "syscall\n\t"
++                   "1:\n\t"
+ #endif
+                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+                    "movq %r8,%rdi\n\t"             /* args */
+@@ -3679,6 +3741,8 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "movw %dx,%fs\n"
+                    "1:\n\t"
+ #elif defined __APPLE__
++                   "cmpb $0,0x341(%r13)\n\t"      /* amd64_thread_data()->pthread_gsbase */
++                   "jne 1f\n\t"
+                    "movq %rax,%rdx\n\t"
+                    "movq %rcx,%r14\n\t"
+                    "movq %r13,%rdi\n\t"            /* teb */
+@@ -3688,6 +3752,7 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "movq %r14,%rcx\n\t"
+                    "movq %rdx,%rax\n\t"
+                    "movq 0x60(%rcx),%r14\n\t"
++                   "1:\n\t"
+ #endif
+                    "movq 0x58(%rcx),%r13\n\t"
+                    "movq 0x28(%rcx),%rdi\n\t"
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index a3d5d85ea5e..bb0b147b29e 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1118,6 +1118,9 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
+  */
+ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
+ {
++#if defined(__APPLE__) && defined(__x86_64__)
++    if (use_macos_pthread_gsbase) virtual_clear_macos_thread_tls();
++#endif
+     close( ntdll_get_thread_data()->alert_fd );
+     close( ntdll_get_thread_data()->wait_fd[0] );
+     close( ntdll_get_thread_data()->wait_fd[1] );
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 2edb0734113..c30c8c8f2ca 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -629,6 +629,11 @@ static inline NTSTATUS map_section( HANDLE mapping, void **ptr, SIZE_T *size, UL
+ 
+ static const ULONG cpsr_user_mask = 0xf620fc30;
+ 
++#if defined(__APPLE__) && defined(__x86_64__)
++extern BOOL use_macos_pthread_gsbase;
++extern void virtual_clear_macos_thread_tls(void);
++#endif
++
+ /* CrossOver 23015: libd3dshared uses the Microsoft ABI for these Unix exports. */
+ #if defined(__APPLE__) && defined(__x86_64__)
+ #include <wine/asm.h>
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 1e4833b5bd9..1246c126249 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4586,6 +4586,26 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
+ }
+ 
+ 
++#if defined(__APPLE__) && defined(__x86_64__)
++/***********************************************************************
++ *           virtual_clear_macos_thread_tls
++ *
++ * A terminated thread can remain in teb_list until another thread joins it.
++ * Retire its TSD mirror before pthread_exit(), including on forced termination
++ * which skips LdrShutdownThread(). Serialize with TLS vector replacement so
++ * another thread cannot write into freed or reused pthread storage.
++ */
++void virtual_clear_macos_thread_tls(void)
++{
++    sigset_t sigset;
++
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    NtCurrentTeb()->Instrumentation[0] = NULL;
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++}
++#endif
++
++
+ /***********************************************************************
+  *           virtual_set_tls_information_teb
+  */
+@@ -4631,7 +4651,8 @@ static NTSTATUS virtual_set_tls_information_teb( PROCESS_TLS_INFORMATION *t, uns
+                 memcpy( ptr, teb->ThreadLocalStoragePointer, sizeof(*ptr) * t->TlsVectorLength );
+                 t->ThreadData[*idx].TlsVector = InterlockedExchangePointer( &teb->ThreadLocalStoragePointer, ptr );
+                 t->ThreadData[*idx].ThreadId = HandleToULong( teb->ClientId.UniqueThread );
+-#ifdef __x86_64__  /* macOS-specific hack */
++#ifdef __x86_64__  /* Instrumentation[0] is set only in macOS pthread gsbase mode. */
++                /* alloc_tls_slot() replaces vectors here while holding virtual_mutex. */
+                 if (teb->Instrumentation[0]) ((TEB *)teb->Instrumentation[0])->ThreadLocalStoragePointer = ptr;
+ #endif
+             }
+diff --git a/tools/gsbase-probe.c b/tools/gsbase-probe.c
+new file mode 100644
+index 00000000000..49c0184b6ee
+--- /dev/null
++++ b/tools/gsbase-probe.c
+@@ -0,0 +1,216 @@
++/* Manual x86_64 macOS gsbase regression probe; see GSBASE-MODEL.md.
++ * Build against this tree's Windows headers with a MinGW compiler.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <stdio.h>
++#include <string.h>
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windows.h"
++#include "winternl.h"
++
++#if !defined(__x86_64__) || defined(__arm64ec__)
++#error This probe requires x86_64 PE code.
++#endif
++
++static BOOL pthread_mode;
++static DWORD tls_index;
++static LONG failures, exceptions, gs_faults;
++static BOOL expect_gs_fault;
++static HANDLE ready, resume;
++static DWORD (WINAPI *tls_functions[96])( DWORD );
++
++#define check(cond) do { if (!(cond)) { \
++    fprintf( stderr, "FAIL line %u, thread %lu: %s\n", __LINE__, GetCurrentThreadId(), #cond ); \
++    InterlockedIncrement( &failures ); } } while (0)
++
++static void check_teb(void)
++{
++    TEB *teb = NtCurrentTeb();
++    void *self, *tls, *peb, **expansion;
++    void *value = ULongToPtr( GetCurrentThreadId() );
++    THREAD_BASIC_INFORMATION info;
++
++    check( !!teb->Instrumentation[0] == pthread_mode );
++    check( !NtQueryInformationThread( GetCurrentThread(), ThreadBasicInformation, &info, sizeof(info), NULL ));
++    check( info.TebBaseAddress == teb );
++    __asm__ volatile( "movq %%gs:0x30,%0" : "=r" (self) );
++    __asm__ volatile( "movq %%gs:0x58,%0" : "=r" (tls) );
++    __asm__ volatile( "movq %%gs:0x60,%0" : "=r" (peb) );
++    check( self == teb );
++    check( tls == teb->ThreadLocalStoragePointer );
++    check( peb == teb->Peb );
++    check( TlsSetValue( tls_index, value ) );
++    check( TlsGetValue( tls_index ) == value );
++    if (pthread_mode)
++    {
++        check( tls_index >= TLS_MINIMUM_AVAILABLE );
++        __asm__ volatile( "movq %%gs:0x1780,%0" : "=r" (expansion) );
++        check( expansion && expansion == teb->TlsExpansionSlots );
++        if (expansion && tls_index >= TLS_MINIMUM_AVAILABLE)
++            check( expansion[tls_index - TLS_MINIMUM_AVAILABLE] == value );
++    }
++}
++
++static LONG CALLBACK exception_handler( EXCEPTION_POINTERS *ptr )
++{
++    if (ptr->ExceptionRecord->ExceptionCode == 0xe0424242)
++    {
++        InterlockedIncrement( &exceptions );
++        return EXCEPTION_CONTINUE_EXECUTION;
++    }
++    if (expect_gs_fault && ptr->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
++        ptr->ExceptionRecord->NumberParameters == 2 && !ptr->ExceptionRecord->ExceptionInformation[1] &&
++        !memcmp( (void *)ptr->ContextRecord->Rip, "\x65\x48\x8b\x00", 4 ))
++    {
++        /* movq %gs:(%rax),%rax: check that gsbase repair does not retry forever. */
++        ptr->ContextRecord->Rip += 4;
++        InterlockedIncrement( &gs_faults );
++        return EXCEPTION_CONTINUE_EXECUTION;
++    }
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++
++static DWORD WINAPI worker( void *arg )
++{
++    unsigned int i;
++
++    for (i = 0; i < 32; i++)
++    {
++        check_teb();
++        Sleep(0);
++    }
++    RaiseException( 0xe0424242, 0, 0, NULL );
++    check_teb();
++    return 0;
++}
++
++static DWORD WINAPI tls_worker( void *arg )
++{
++    unsigned int i;
++
++    check_teb();
++    SetEvent( ready );
++    WaitForSingleObject( resume, INFINITE );
++    check_teb();
++    for (i = 0; i < ARRAY_SIZE(tls_functions); i++)
++        check( tls_functions[i]( GetCurrentThreadId() ) == 0x1234abcd );
++    return 0;
++}
++
++static DWORD WINAPI victim( void *arg )
++{
++    SetEvent( ready );
++    Sleep(INFINITE);
++    return 0;
++}
++
++static void load_tls_dlls( const char *dir, unsigned int first, unsigned int end )
++{
++    char path[MAX_PATH];
++    unsigned int i;
++    HMODULE module;
++
++    for (i = first; i < end; i++)
++    {
++        snprintf( path, sizeof(path), "%s/gsbase-tls-%u.dll", dir, i );
++        module = LoadLibraryA( path );
++        if (!module || !(tls_functions[i] = (void *)GetProcAddress( module, "gsbase_tls" )))
++        {
++            fprintf( stderr, "cannot load fixture %s, error %lu\n", path, GetLastError() );
++            ExitProcess(2);
++        }
++        check_teb();
++        check( tls_functions[i]( GetCurrentThreadId() ) == 0x1234abcd );
++    }
++}
++
++static void test_tls_growth( const char *dir )
++{
++    THREAD_BASIC_INFORMATION info;
++    HANDLE live, dead;
++    unsigned int i;
++
++    ready = CreateEventA( NULL, FALSE, FALSE, NULL );
++    resume = CreateEventA( NULL, FALSE, FALSE, NULL );
++    if (!ready || !resume) ExitProcess(2);
++    if (!(live = CreateThread( NULL, 0, tls_worker, NULL, 0, NULL ))) ExitProcess(2);
++    if (WaitForSingleObject( ready, 60000 ) != WAIT_OBJECT_0) ExitProcess(2);
++    load_tls_dlls( dir, 0, 48 );
++
++    /* Leave a terminated thread in Proton's TEB list while the next loads
++     * grow the TLS vectors again. Its pthread storage must no longer be used. */
++    if (!(dead = CreateThread( NULL, 0, victim, NULL, 0, NULL ))) ExitProcess(2);
++    if (WaitForSingleObject( ready, 60000 ) != WAIT_OBJECT_0) ExitProcess(2);
++    if (NtQueryInformationThread( dead, ThreadBasicInformation, &info, sizeof(info), NULL )) ExitProcess(2);
++    if (!TerminateThread( dead, 0 ) || WaitForSingleObject( dead, 60000 ) != WAIT_OBJECT_0) ExitProcess(2);
++    if (pthread_mode)
++    {
++        TEB *teb = info.TebBaseAddress;
++
++        /* The server can signal the thread handle before Unix teardown ends. */
++        for (i = 0; i < 10000 && *(void *volatile *)&teb->Instrumentation[0]; i++) Sleep(1);
++        check( !teb->Instrumentation[0] );
++    }
++    load_tls_dlls( dir, 48, ARRAY_SIZE(tls_functions) );
++    SetEvent( resume );
++    if (WaitForSingleObject( live, 60000 ) != WAIT_OBJECT_0) ExitProcess(2);
++    CloseHandle( live );
++    CloseHandle( dead );
++    CloseHandle( ready );
++    CloseHandle( resume );
++}
++
++int main( int argc, char **argv )
++{
++    HANDLE threads[8];
++    void *handler;
++    unsigned int round, i;
++
++    if (argc != 3 || (strcmp( argv[1], "on" ) && strcmp( argv[1], "off" )))
++    {
++        fprintf( stderr, "usage: gsbase-probe.exe on|off fixture-directory\n" );
++        return 2;
++    }
++    pthread_mode = !strcmp( argv[1], "on" );
++    tls_index = TlsAlloc();
++    if (tls_index == TLS_OUT_OF_INDEXES) return 2;
++    if (!(handler = AddVectoredExceptionHandler( 1, exception_handler ))) return 2;
++    check_teb();
++    test_tls_growth( argv[2] );
++    for (round = 0; round < 8; round++)
++    {
++        /* Existing and newly created threads must keep the startup selection. */
++        if (round == 4)
++            check( SetEnvironmentVariableA( "CX_ACTIVE_GRAPHICS_BACKEND", pthread_mode ? "dxvk" : "d3dmetal" ));
++        for (i = 0; i < ARRAY_SIZE(threads); i++)
++        {
++            threads[i] = CreateThread( NULL, 0, worker, NULL, 0, NULL );
++            if (!threads[i]) return 2;
++        }
++        if (WaitForMultipleObjects( ARRAY_SIZE(threads), threads, TRUE, 60000 ) != WAIT_OBJECT_0) return 2;
++        for (i = 0; i < ARRAY_SIZE(threads); i++) CloseHandle( threads[i] );
++        check_teb();
++    }
++    check( exceptions == 64 );
++    if (pthread_mode && NtCurrentTeb()->Instrumentation[0])
++    {
++        ULONG_PTR offset = -(ULONG_PTR)NtCurrentTeb()->Instrumentation[0];
++
++        expect_gs_fault = TRUE;
++        __asm__ volatile( ".byte 0x65,0x48,0x8b,0x00" : "+a" (offset) :: "memory" );
++        expect_gs_fault = FALSE;
++        check( gs_faults == 1 );
++        check_teb();
++    }
++    check( TlsFree( tls_index ) );
++    RemoveVectoredExceptionHandler( handler );
++    printf( "gsbase %s: %ld failures, %ld exceptions, %ld gs faults\n",
++            pthread_mode ? "on" : "off", failures, exceptions, gs_faults );
++    return failures ? 1 : 0;
++}
+diff --git a/tools/gsbase-tls.c b/tools/gsbase-tls.c
+new file mode 100644
+index 00000000000..272b7a2cea3
+--- /dev/null
++++ b/tools/gsbase-tls.c
+@@ -0,0 +1,24 @@
++/* Static TLS fixture for gsbase-probe.c; see GSBASE-MODEL.md.
++ * Licensed under the GNU Lesser General Public License, version 2.1 or later.
++ */
++
++#include <windows.h>
++
++/* MinGW's CRT supplies the TLS directory and its .tls / .tls$ZZZ boundaries.
++ * Use a real PE TLS template, avoiding GCC's emulated __thread storage. */
++static DWORD initial_value __attribute__((section(".tls$AAA"), used)) = 0x1234abcd;
++extern const IMAGE_TLS_DIRECTORY64 _tls_used;
++extern DWORD _tls_index;
++
++__declspec(dllexport) DWORD WINAPI gsbase_tls( DWORD value )
++{
++    void **vector;
++    DWORD *slot, old;
++    ULONG_PTR offset = (ULONG_PTR)&initial_value - _tls_used.StartAddressOfRawData;
++
++    __asm__ volatile( "movq %%gs:0x58,%0" : "=r" (vector) );
++    slot = (DWORD *)((char *)vector[_tls_index] + offset);
++    old = *slot;
++    *slot = value;
++    return old;
++}
+-- 
+2.43.0
+

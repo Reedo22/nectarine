@@ -1,0 +1,53 @@
+From 2ad25d3e47b24914e1a311976e6b2c2ecad658d9 Mon Sep 17 00:00:00 2001
+From: Reedo22 <141674188+Reedo22@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 23:05:48 -0400
+Subject: [PATCH] winemac: Accept no-error contexts and fall back to legacy GL
+ for compatibility profiles above 2.1.
+
+SDL2 games (Half-Life 25th anniversary) ask for a 4.2 compatibility context with
+WGL_CONTEXT_OPENGL_NO_ERROR_ARB. Both made wglCreateContextAttribsARB fail, the
+game concluded OpenGL was broken and restarted in software mode (then asserted).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winemac.drv/opengl.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/dlls/winemac.drv/opengl.c b/dlls/winemac.drv/opengl.c
+index 800872a..f005488 100644
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -2153,6 +2153,11 @@ static BOOL macdrv_context_create(int format, void *shared, const int *attrib_li
+                 profile = value;
+                 break;
+ 
++            case WGL_CONTEXT_OPENGL_NO_ERROR_ARB:
++                /* advertised via WGL_ARB_create_context_no_error; only a hint */
++                if (value) WARN("WGL_CONTEXT_OPENGL_NO_ERROR_ARB ignored\n");
++                break;
++
+             default:
+                 WARN("Unknown attribute %s.\n", debugstr_attrib(attr, value));
+                 RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
+@@ -2160,6 +2165,18 @@ static BOOL macdrv_context_create(int format, void *shared, const int *attrib_li
+         }
+     }
+ 
++    /* macOS has no compatibility profile above 2.1. Apps asking for one (e.g. SDL2 games such
++     * as Half-Life request 4.2 compatibility) generally use legacy GL only, so give them the
++     * legacy context instead of failing context creation outright. */
++    if (profile == WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB &&
++        !(flags & WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB) &&
++        (major > 2 || (major == 2 && minor > 1)))
++    {
++        WARN("compatibility profile %u.%u not available on macOS, using a legacy 2.1 context\n", major, minor);
++        major = 2;
++        minor = 1;
++    }
++
+     if ((major == 3 && (minor == 2 || minor == 3)) ||
+         (major == 4 && (minor == 0 || minor == 1)))
+     {
+-- 
+2.54.0 (Apple Git-157)
+

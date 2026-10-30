@@ -1,0 +1,74 @@
+From 63531e668b1c6c9807312116f913872add46256c Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Mon, 26 Oct 2026 17:01:28 -0400
+Subject: [PATCH 11/11] ntdll: Don't mirror the PEB into the macOS TSD in
+ D3DMetal mode.
+
+On macOS 27, system code keeps its own object pointer in TSD slot 12 (%gs:0x60) and writes through
+it; with the PEB mirrored there it overwrote PEB->ProcessHeap with a malloc pointer and every process
+crashed in its first heap allocation. Mirror only Tib.Self and ThreadLocalStoragePointer, and make
+the three PE-side ntdll sites that read %gs:0x60 go through %gs:0x30 instead (same result in the
+default model). Verified: D3D12 smoke test renders correctly through Apple's D3DMetal.
+---
+ dlls/ntdll/signal_x86_64.c      | 9 ++++++---
+ dlls/ntdll/unix/signal_x86_64.c | 5 +++--
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/ntdll/signal_x86_64.c b/dlls/ntdll/signal_x86_64.c
+index 6fbcbd148aa..27d21d06c66 100644
+--- a/dlls/ntdll/signal_x86_64.c
++++ b/dlls/ntdll/signal_x86_64.c
+@@ -438,7 +438,8 @@ __ASM_GLOBAL_FUNC( KiUserCallbackDispatcher,
+                    "movl 0x28(%rsp),%edx\n\t"  /* len */
+                    "movl 0x2c(%rsp),%r8d\n\t"  /* id */
+ #ifdef __WINE_PE_BUILD
+-                   "movq %gs:0x60,%rax\n\t"     /* peb */
++                   "movq %gs:0x30,%rax\n\t"     /* teb (works with the macOS D3DMetal %gs model too) */
++                   "movq 0x60(%rax),%rax\n\t"   /* peb */
+                    "movq 0x58(%rax),%rax\n\t"   /* peb->KernelCallbackTable */
+                    "call *(%rax,%r8,8)\n\t"     /* KernelCallbackTable[id] */
+                    ".seh_handler " __ASM_NAME("user_callback_handler") ", @except\n\t"
+@@ -853,7 +854,8 @@ __ASM_GLOBAL_FUNC( RtlRaiseException,
+                    "movq %rax,0x58(%rdx)\n\t"   /* Context->Dr2 */
+                    "movq %rax,0x60(%rdx)\n\t"   /* Context->Dr3 */
+                    "movl $1,%r8d\n\t"
+-                   "movq %gs:0x60,%rax\n\t"     /* Peb */
++                   "movq %gs:0x30,%rax\n\t"     /* teb */
++                   "movq 0x60(%rax),%rax\n\t"   /* Peb */
+                    "cmpb $0,0x02(%rax)\n\t"     /* BeingDebugged */
+                    "jne 1f\n\t"
+                    "call " __ASM_NAME("dispatch_exception") "\n"
+@@ -1097,7 +1099,8 @@ __ASM_GLOBAL_FUNC( DbgUiRemoteBreakin,
+                    ".seh_stackalloc 0x28\n\t"
+                    ".seh_endprologue\n\t"
+                    ".seh_handler DbgUiRemoteBreakin_handler, @except\n\t"
+-                   "mov %gs:0x60,%rax\n\t"
++                   "mov %gs:0x30,%rax\n\t"
++                   "mov 0x60(%rax),%rax\n\t"
+                    "cmpb $0,2(%rax)\n\t"
+                    "je 1f\n\t"
+                    "call " __ASM_NAME("DbgBreakPoint") "\n"
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 9cc730abdbc..b6e4c4038fc 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -3159,13 +3159,14 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend,
+         void *check;
+ 
+         /* CrossOver's macOS model: never move %gs away from pthread's TSD.
+-         * Only these Windows fields can be overlaid on its reserved slots. Write them through
++         * Only Tib.Self and ThreadLocalStoragePointer are overlaid on its reserved slots. Write them through
+          * %gs itself, as CrossOver does: under Rosetta the emulated %gs base need not be the
+          * kernel's thread_handle, and PE code only ever reads them through %gs. */
+         __asm__ volatile( "movq %0,%%gs:%c1" :: "r" (teb->Tib.Self), "n" (FIELD_OFFSET(TEB, Tib.Self)) );
+         __asm__ volatile( "movq %0,%%gs:%c1" :: "r" (teb->ThreadLocalStoragePointer),
+                           "n" (FIELD_OFFSET(TEB, ThreadLocalStoragePointer)) );
+-        __asm__ volatile( "movq %0,%%gs:%c1" :: "r" (teb->Peb), "n" (FIELD_OFFSET(TEB, Peb)) );
++        /* Not Peb (%gs:0x60): on macOS 27 system code keeps its own object pointer in that TSD slot and
++         * writes through it, which overwrote PEB->ProcessHeap. PE code reaches the PEB via Tib.Self. */
+         if (pthread_teb->Tib.Self != teb->Tib.Self)
+         {
+             __asm__ volatile( "movq %%gs:0,%0" : "=r" (check) );
+-- 
+2.43.0
+

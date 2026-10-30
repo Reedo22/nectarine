@@ -1,0 +1,46 @@
+From d3514bdac518368d0e2443aa64a3b09e9f60b1e5 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 16:31:46 -0400
+Subject: [PATCH 20/29] server: Keep the default local user SID on macOS.
+
+Replaces the host-UUID derived SID: existing prefixes were created with the
+upstream default, and a changed SID strands data bound to the user.
+---
+ server/token.c | 21 +++------------------
+ 1 file changed, 3 insertions(+), 18 deletions(-)
+
+diff --git a/server/token.c b/server/token.c
+index e4e36086435..7856cfbb801 100644
+--- a/server/token.c
++++ b/server/token.c
+@@ -221,24 +221,9 @@ void init_user_sid(void)
+     FILE *f;
+ 
+ #ifdef __APPLE__
+-    /* No /etc/machine-id on macOS: use the first 64 bits of the hardware UUID, the
+-     * same amount of identity the Linux path takes from machine-id. */
+-    {
+-        static const struct timespec no_wait = { 0, 0 };
+-        unsigned char uuid[16];
+-        unsigned int i;
+-
+-        if (gethostuuid( uuid, &no_wait ))
+-        {
+-            fprintf( stderr, "Failed to get host UUID, error %s.\n", strerror( errno ));
+-            return;
+-        }
+-        for (id = 0, i = 0; i < 8; i++) id = (id << 8) | uuid[i];
+-        local_user_sid.sub_auth[1] = id >> 32;
+-        local_user_sid.sub_auth[2] = id & 0xffffffff;
+-        local_user_sid.sub_auth[3] = getuid();
+-        return;
+-    }
++    /* Keep the upstream default SID: existing macOS prefixes (and the data apps bound
++     * to their user, e.g. Steam's saved login) were created with it. */
++    return;
+ #endif
+ 
+     f = fopen( "/etc/machine-id", "r" );
+-- 
+2.43.0
+

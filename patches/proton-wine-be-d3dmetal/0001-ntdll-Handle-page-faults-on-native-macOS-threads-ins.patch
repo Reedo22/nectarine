@@ -1,0 +1,58 @@
+From 25cd0154e542a36069f171c9a13751bc00edc53b Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Mon, 26 Oct 2026 17:53:54 -0400
+Subject: [PATCH] ntdll: Handle page faults on native macOS threads instead of
+ hanging.
+
+D3DMetal's dispatch-queue threads fault inside Apple's x86 driver code (IOGPU residency commit with
+GPTK 4.0b2, AGX executeCommandsInBuffer with 3.0) and segv_handler, which assumes a Wine TEB, spun
+forever: D3D12 apps froze after their first frame (also under CrossOver on this Mac). Detect native
+threads by the empty TEB slot, let virtual_handle_fault resolve Wine-managed pages, and otherwise
+log and fall back to the default action.
+---
+ dlls/ntdll/unix/signal_x86_64.c | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index b6e4c4038fc..275a358fc67 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2541,6 +2541,35 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+                                (ULONG_PTR *)&RDX_sig(ucontext) ))
+         return;
+ 
++#ifdef __APPLE__
++    {
++        /* Native macOS threads (e.g. Metal / D3DMetal dispatch queues) have no TEB in TSD slot 6, and
++         * everything below assumes one, so they used to spin here forever. Their page faults can
++         * still be Wine's business (write-watched or Rosetta-misreported pages that Apple's x86
++         * driver code writes), so resolve those and resume; let anything else crash normally. */
++        void *self;
++        __asm__( "movq %%gs:0x30,%0" : "=r" (self) );
++        if (!self)
++        {
++            if (TRAP_sig(ucontext) == TRAP_x86_PAGEFLT)
++            {
++                rec.NumberParameters = 2;
++                rec.ExceptionInformation[0] = (ERROR_sig(ucontext) >> 1) & 0x09;
++                rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
++                if (!virtual_handle_fault( &rec, (void *)RSP_sig(ucontext) )) return;
++            }
++            fprintf( stderr, "wine: unhandled fault in native thread: trap %u rip %p addr %p\n",
++                     (unsigned int)TRAP_sig(ucontext), (void *)RIP_sig(ucontext), siginfo->si_addr );
++            {
++                struct sigaction sa = { 0 };
++                sa.sa_handler = SIG_DFL;
++                sigaction( signal, &sa, NULL );
++            }
++            return;
++        }
++    }
++#endif
++
+     init_handler( sigcontext );
+     rec.ExceptionAddress = (void *)RIP_sig(ucontext);
+     save_context( &context, ucontext );
+-- 
+2.43.0
+

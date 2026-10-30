@@ -1,0 +1,81 @@
+From 09d87f266adcb42505d9d3a9b13f52c806df5fc8 Mon Sep 17 00:00:00 2001
+From: Reedo22 <141674188+Reedo22@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 18:27:32 -0400
+Subject: [PATCH] winemac: Report framebuffer component sizes in legacy
+ contexts.
+
+Legacy CGL contexts reject GL_RED_BITS and related queries. Return the selected Wine pixel format for compatibility with SDL and older OpenGL applications.
+---
+ dlls/winemac.drv/opengl.c | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/dlls/winemac.drv/opengl.c b/dlls/winemac.drv/opengl.c
+index f005488..a52f661 100644
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -62,6 +62,7 @@ static struct gl_info gl_info;
+ struct macdrv_context
+ {
+     int                     format;
++    BOOL                    core;
+     GLint                   renderer_id;
+     macdrv_opengl_context   context;
+     CGLContextObj           cglcontext;
+@@ -2225,6 +2226,7 @@ static BOOL macdrv_context_create(int format, void *shared, const int *attrib_li
+     if (!(context = calloc(1, sizeof(*context)))) return FALSE;
+ 
+     context->format = format;
++    context->core = core;
+     context->renderer_id = renderer_id;
+     if (!create_context(context, share_context ? share_context->cglcontext : NULL, major))
+     {
+@@ -2761,11 +2763,46 @@ static BOOL macdrv_context_destroy(void *private)
+     return TRUE;
+ }
+ 
++static void macdrv_glGetIntegerv(GLenum pname, GLint *params)
++{
++    struct macdrv_context *context = NtCurrentTeb()->glReserved2;
++
++    switch (pname)
++    {
++        case GL_RED_BITS:
++        case GL_GREEN_BITS:
++        case GL_BLUE_BITS:
++        case GL_ALPHA_BITS:
++        case GL_DEPTH_BITS:
++        case GL_STENCIL_BITS:
++            if (context && !context->core)
++            {
++                const pixel_format *pf = get_pixel_format(context->format, TRUE);
++                const struct color_mode *mode = &color_modes[pf->color_mode];
++
++                switch (pname)
++                {
++                    case GL_RED_BITS:     *params = mode->red_bits; break;
++                    case GL_GREEN_BITS:   *params = mode->green_bits; break;
++                    case GL_BLUE_BITS:    *params = mode->blue_bits; break;
++                    case GL_ALPHA_BITS:   *params = mode->alpha_bits; break;
++                    case GL_DEPTH_BITS:   *params = pf->depth_bits; break;
++                    case GL_STENCIL_BITS: *params = pf->stencil_bits; break;
++                }
++                return;
++            }
++            break;
++    }
++
++    pglGetIntegerv(pname, params);
++}
++
+ static void *macdrv_get_proc_address(const char *name)
+ {
+     /* redirect some standard OpenGL functions */
+     if (!strcmp(name, "glCopyPixels")) return macdrv_glCopyPixels;
+     if (!strcmp(name, "glGetString")) return macdrv_glGetString;
++    if (!strcmp(name, "glGetIntegerv")) return macdrv_glGetIntegerv;
+     if (!strcmp(name, "glReadPixels")) return macdrv_glReadPixels;
+ 
+     /* redirect some OpenGL extension functions */
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,44 @@
+From 737a239dff06140c6a28f756d0bd4272d280c799 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 14:23:57 -0400
+Subject: [PATCH 15/29] win32u: Default the Vulkan fullscreen hack off on
+ macOS.
+
+winemac.drv already sizes client views in raw monitor pixels and scales
+natively, so the extra compute scaling pass only costs GPU time: DOOM 64
+(D3D11 via DXVK) fell from 60 to ~23 fps with it and held 60 without.
+Also only force shaderStorageImageWriteWithoutFormat when the hack is on.
+---
+ dlls/win32u/vulkan.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 5401c56d393..f5bc8f93d89 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -1424,6 +1424,7 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device,
+     device->queues = (void *)(device + 1);
+     device->queue_props = (void *)(device->queues + queue_count);
+ 
++if (fshack_enabled)
+ {
+         VkPhysicalDeviceFeatures2 *features2;
+ 
+@@ -4821,7 +4822,14 @@ static void vulkan_init_once(void)
+     VkResult res;
+ 
+     const char *env = getenv( "WINE_DISABLE_FULLSCREEN_HACK" );
++#ifdef __APPLE__
++    /* winemac.drv already presents at the raw monitor size and scales natively; the extra
++     * compute blit cost DOOM 64 more than half its frame rate on an M1 Pro. Opt in with
++     * WINE_DISABLE_FULLSCREEN_HACK=0. */
++    fshack_enabled = env && !atoi( env );
++#else
+     fshack_enabled = !env || !atoi( env );
++#endif
+ 
+ #ifdef SONAME_LIBVULKAN
+     vulkan_handle = dlopen( SONAME_LIBVULKAN, RTLD_NOW );
+-- 
+2.43.0
+

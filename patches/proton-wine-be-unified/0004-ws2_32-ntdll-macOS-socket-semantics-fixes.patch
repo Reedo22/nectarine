@@ -1,0 +1,353 @@
+diff --git a/dlls/ntdll/unix/socket.c b/dlls/ntdll/unix/socket.c
+index 96e8152..0a94f68 100644
+--- a/dlls/ntdll/unix/socket.c
++++ b/dlls/ntdll/unix/socket.c
+@@ -1596,6 +1596,50 @@ static NTSTATUS do_getsockopt( HANDLE handle, IO_STATUS_BLOCK *io, int level,
+ }
+
+
++static NTSTATUS do_getsockopt_bool( HANDLE handle, IO_STATUS_BLOCK *io, int level,
++                                    int option, void *out_buffer, ULONG out_size )
++{
++    NTSTATUS status;
++    int value;
++
++    if ((status = do_getsockopt( handle, io, level, option, &value, sizeof(value) ))) return status;
++
++    value = !!value;
++    memcpy( out_buffer, &value, min( out_size, sizeof(value) ) );
++    if (io) io->Information = out_size < sizeof(value) ? 1 : sizeof(value);
++    return STATUS_SUCCESS;
++}
++
++
++static NTSTATUS do_getsockopt_byte( HANDLE handle, IO_STATUS_BLOCK *io, int level,
++                                    int option, void *out_buffer, ULONG out_size )
++{
++    NTSTATUS status;
++    int value = 0;
++
++    if ((status = do_getsockopt( handle, io, level, option, &value, sizeof(value) ))) return status;
++
++    memcpy( out_buffer, &value, out_size < sizeof(value) ? 1 : sizeof(value) );
++    if (io) io->Information = out_size < sizeof(value) ? 1 : sizeof(value);
++    return STATUS_SUCCESS;
++}
++
++
++static NTSTATUS do_getsockopt_bool_byte( HANDLE handle, IO_STATUS_BLOCK *io, int level,
++                                         int option, void *out_buffer, ULONG out_size )
++{
++    NTSTATUS status;
++    int value = 0;
++
++    if ((status = do_getsockopt( handle, io, level, option, &value, sizeof(value) ))) return status;
++
++    value = !!value;
++    memcpy( out_buffer, &value, out_size < sizeof(value) ? 1 : sizeof(value) );
++    if (io) io->Information = out_size < sizeof(value) ? 1 : sizeof(value);
++    return STATUS_SUCCESS;
++}
++
++
+ static NTSTATUS do_setsockopt( HANDLE handle, IO_STATUS_BLOCK *io, int level,
+                                int option, const void *optval, socklen_t optlen )
+ {
+@@ -1603,6 +1647,17 @@ static NTSTATUS do_setsockopt( HANDLE handle, IO_STATUS_BLOCK *io, int level,
+     NTSTATUS status;
+     int ret;
+
++#ifdef __APPLE__
++    int value = 0;
++
++    if (optlen < sizeof(int) && (level != IPPROTO_IP || option != IP_OPTIONS))
++    {
++        memcpy( &value, optval, optlen );
++        optval = &value;
++        optlen = sizeof(value);
++    }
++#endif
++
+     if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
+         return status;
+
+@@ -2087,13 +2142,13 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+             break;
+
+         case IOCTL_AFD_WINE_GET_SO_BROADCAST:
+-            return do_getsockopt( handle, io, SOL_SOCKET, SO_BROADCAST, out_buffer, out_size );
++            return do_getsockopt_bool( handle, io, SOL_SOCKET, SO_BROADCAST, out_buffer, out_size );
+
+         case IOCTL_AFD_WINE_SET_SO_BROADCAST:
+             return do_setsockopt( handle, io, SOL_SOCKET, SO_BROADCAST, in_buffer, in_size );
+
+         case IOCTL_AFD_WINE_GET_SO_KEEPALIVE:
+-            return do_getsockopt( handle, io, SOL_SOCKET, SO_KEEPALIVE, out_buffer, out_size );
++            return do_getsockopt_bool( handle, io, SOL_SOCKET, SO_KEEPALIVE, out_buffer, out_size );
+
+         case IOCTL_AFD_WINE_SET_SO_KEEPALIVE:
+             return do_setsockopt( handle, io, SOL_SOCKET, SO_KEEPALIVE, in_buffer, in_size );
+@@ -2133,7 +2188,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+         }
+
+         case IOCTL_AFD_WINE_GET_SO_OOBINLINE:
+-            return do_getsockopt( handle, io, SOL_SOCKET, SO_OOBINLINE, out_buffer, out_size );
++            return do_getsockopt_bool( handle, io, SOL_SOCKET, SO_OOBINLINE, out_buffer, out_size );
+
+         case IOCTL_AFD_WINE_SET_SO_OOBINLINE:
+             return do_setsockopt( handle, io, SOL_SOCKET, SO_OOBINLINE, in_buffer, in_size );
+@@ -2246,7 +2301,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+         {
+             int sock_type = get_sock_type( handle );
+             if (sock_type != SOCK_DGRAM && sock_type != SOCK_RAW) return STATUS_INVALID_PARAMETER;
+-            return do_getsockopt( handle, io, IPPROTO_IP, IP_MULTICAST_LOOP, out_buffer, out_size );
++            return do_getsockopt_bool_byte( handle, io, IPPROTO_IP, IP_MULTICAST_LOOP, out_buffer, out_size );
+         }
+
+         case IOCTL_AFD_WINE_SET_IP_MULTICAST_LOOP:
+@@ -2260,7 +2315,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+         {
+             int sock_type = get_sock_type( handle );
+             if (sock_type != SOCK_DGRAM && sock_type != SOCK_RAW) return STATUS_INVALID_PARAMETER;
+-            return do_getsockopt( handle, io, IPPROTO_IP, IP_MULTICAST_TTL, out_buffer, out_size );
++            return do_getsockopt_byte( handle, io, IPPROTO_IP, IP_MULTICAST_TTL, out_buffer, out_size );
+         }
+
+         case IOCTL_AFD_WINE_SET_IP_MULTICAST_TTL:
+@@ -2339,13 +2394,13 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+ #endif
+
+         case IOCTL_AFD_WINE_GET_IP_TOS:
+-            return do_getsockopt( handle, io, IPPROTO_IP, IP_TOS, out_buffer, out_size );
++            return do_getsockopt_byte( handle, io, IPPROTO_IP, IP_TOS, out_buffer, out_size );
+
+         case IOCTL_AFD_WINE_SET_IP_TOS:
+             return do_setsockopt( handle, io, IPPROTO_IP, IP_TOS, in_buffer, in_size );
+
+         case IOCTL_AFD_WINE_GET_IP_TTL:
+-            return do_getsockopt( handle, io, IPPROTO_IP, IP_TTL, out_buffer, out_size );
++            return do_getsockopt_byte( handle, io, IPPROTO_IP, IP_TTL, out_buffer, out_size );
+
+         case IOCTL_AFD_WINE_SET_IP_TTL:
+             return do_setsockopt( handle, io, IPPROTO_IP, IP_TTL, in_buffer, in_size );
+@@ -2369,6 +2424,9 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+ #endif
+
+         case IOCTL_AFD_WINE_GET_IPV6_DONTFRAG:
++#ifdef IPV6_DONTFRAG
++            return do_getsockopt_bool_byte( handle, io, IPPROTO_IPV6, IPV6_DONTFRAG, out_buffer, out_size );
++#else
+         {
+             socklen_t len = out_size;
+             int ret;
+@@ -2376,9 +2434,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+             if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
+                 return status;
+
+-#ifdef IPV6_DONTFRAG
+-            ret = getsockopt( fd, IPPROTO_IPV6, IPV6_DONTFRAG, out_buffer, &len );
+-#elif defined(IPV6_MTU_DISCOVER) && defined(IPV6_PMTUDISC_DONT)
++#if defined(IPV6_MTU_DISCOVER) && defined(IPV6_PMTUDISC_DONT)
+             {
+                 int value;
+
+@@ -2406,6 +2462,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+             }
+             break;
+         }
++#endif
+
+         case IOCTL_AFD_WINE_SET_IPV6_DONTFRAG:
+ #ifdef IPV6_DONTFRAG
+@@ -2435,7 +2492,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+         {
+             int sock_type = get_sock_type( handle );
+             if (sock_type != SOCK_DGRAM && sock_type != SOCK_RAW) return STATUS_INVALID_PARAMETER;
+-            return do_getsockopt( handle, io, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, out_buffer, out_size );
++            return do_getsockopt_byte( handle, io, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, out_buffer, out_size );
+         }
+
+         case IOCTL_AFD_WINE_SET_IPV6_MULTICAST_HOPS:
+@@ -2463,7 +2520,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+         {
+             int sock_type = get_sock_type( handle );
+             if (sock_type != SOCK_DGRAM && sock_type != SOCK_RAW) return STATUS_INVALID_PARAMETER;
+-            return do_getsockopt( handle, io, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, out_buffer, out_size );
++            return do_getsockopt_bool_byte( handle, io, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, out_buffer, out_size );
+         }
+
+         case IOCTL_AFD_WINE_SET_IPV6_MULTICAST_LOOP:
+@@ -2522,7 +2579,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+ #endif
+
+         case IOCTL_AFD_WINE_GET_IPV6_UNICAST_HOPS:
+-            return do_getsockopt( handle, io, IPPROTO_IPV6, IPV6_UNICAST_HOPS, out_buffer, out_size );
++            return do_getsockopt_byte( handle, io, IPPROTO_IPV6, IPV6_UNICAST_HOPS, out_buffer, out_size );
+
+         case IOCTL_AFD_WINE_SET_IPV6_UNICAST_HOPS:
+             return do_setsockopt( handle, io, IPPROTO_IPV6, IPV6_UNICAST_HOPS, in_buffer, in_size );
+@@ -2645,7 +2702,7 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
+ #endif
+
+         case IOCTL_AFD_WINE_GET_TCP_NODELAY:
+-            return do_getsockopt( handle, io, IPPROTO_TCP, TCP_NODELAY, out_buffer, out_size );
++            return do_getsockopt_bool( handle, io, IPPROTO_TCP, TCP_NODELAY, out_buffer, out_size );
+
+         case IOCTL_AFD_WINE_SET_TCP_NODELAY:
+             return do_setsockopt( handle, io, IPPROTO_TCP, TCP_NODELAY, in_buffer, in_size );
+diff --git a/dlls/ws2_32/Makefile.in b/dlls/ws2_32/Makefile.in
+index e80def6..1057cff 100644
+--- a/dlls/ws2_32/Makefile.in
++++ b/dlls/ws2_32/Makefile.in
+@@ -1,4 +1,4 @@
+-EXTRADEFS = -D_WS2_32_
++EXTRADEFS = -D_WS2_32_ -D__APPLE__
+ MODULE    = ws2_32.dll
+ UNIXLIB   = ws2_32.so
+ IMPORTLIB = ws2_32
+diff --git a/dlls/ws2_32/protocol.c b/dlls/ws2_32/protocol.c
+index 3e91ab8..05c9eee 100644
+--- a/dlls/ws2_32/protocol.c
++++ b/dlls/ws2_32/protocol.c
+@@ -45,6 +45,41 @@ static char *get_fqdn(void)
+     return ret;
+ }
+
++#ifdef __APPLE__
++static int compare_addrinfo( const struct addrinfo *a, const struct addrinfo *b )
++{
++    int ret;
++
++#define COMPARE_FIELD(field) if (a->field != b->field) return a->field < b->field ? -1 : 1
++    COMPARE_FIELD( ai_flags );
++    COMPARE_FIELD( ai_family );
++    COMPARE_FIELD( ai_socktype );
++    COMPARE_FIELD( ai_protocol );
++#undef COMPARE_FIELD
++    if ((ret = memcmp( a->ai_addr, b->ai_addr, min( a->ai_addrlen, b->ai_addrlen ) ))) return ret;
++    if (a->ai_addrlen != b->ai_addrlen) return a->ai_addrlen < b->ai_addrlen ? -1 : 1;
++    return 0;
++}
++
++static void sort_addrinfo( struct addrinfo **info )
++{
++    struct addrinfo *remaining = *info, *sorted = NULL, **tail = &sorted;
++
++    while (remaining)
++    {
++        struct addrinfo **best = &remaining, **cursor;
++
++        for (cursor = &remaining; (*cursor)->ai_next; cursor = &(*cursor)->ai_next)
++            if (compare_addrinfo( (*cursor)->ai_next, *best ) < 0) best = &(*cursor)->ai_next;
++        *tail = *best;
++        *best = (*best)->ai_next;
++        tail = &(*tail)->ai_next;
++    }
++    *tail = NULL;
++    *info = sorted;
++}
++#endif
++
+ /* call Unix getaddrinfo, allocating a large enough buffer */
+ static int do_getaddrinfo( const char *node, const char *service,
+                            const struct addrinfo *hints, struct addrinfo **info )
+@@ -53,6 +88,10 @@ static int do_getaddrinfo( const char *node, const char *service,
+     struct getaddrinfo_params params = { node, service, hints, NULL, &size };
+     int ret;
+
++#ifdef __APPLE__
++    if (!service || !*service) params.service = "0";
++#endif
++
+     for (;;)
+     {
+         if (!(params.info = malloc( size )))
+@@ -60,6 +99,9 @@ static int do_getaddrinfo( const char *node, const char *service,
+         if (!(ret = WS_CALL( getaddrinfo, &params )))
+         {
+             *info = params.info;
++#ifdef __APPLE__
++            if (!node) sort_addrinfo( info );
++#endif
+             return ret;
+         }
+         free( params.info );
+@@ -221,6 +263,10 @@ int WINAPI getaddrinfo( const char *node, const char *service,
+
+     ret = do_getaddrinfo( node, service, hints, info );
+
++#ifdef __APPLE__
++    if (!node && service && ret == WSAHOST_NOT_FOUND) ret = WSATYPE_NOT_FOUND;
++#endif
++
+     if (ret && (!hints || !(hints->ai_flags & AI_NUMERICHOST)) && node)
+     {
+         if (!fqdn && !(fqdn = get_fqdn()))
+@@ -228,13 +274,16 @@ int WINAPI getaddrinfo( const char *node, const char *service,
+             free( nodev6 );
+             return WSA_NOT_ENOUGH_MEMORY;
+         }
+-        if (!strcmp( fqdn, node ) || (!strncmp( fqdn, node, strlen( node ) ) && fqdn[strlen( node )] == '.'))
++        if (!lstrcmpiA( fqdn, node ) ||
++            (strlen( fqdn ) > strlen( node ) && fqdn[strlen( node )] == '.' &&
++             CompareStringA( LOCALE_INVARIANT, NORM_IGNORECASE, fqdn, strlen( node ), node, strlen( node ) ) == CSTR_EQUAL))
+         {
+-            /* If it didn't work it means the host name IP is not in /etc/hosts, try again
+-             * by sending a NULL host and avoid sending a NULL servname too because that
+-             * is invalid */
+             ERR_(winediag)( "Failed to resolve your host name IP\n" );
++#ifdef __APPLE__
++            ret = do_getaddrinfo( fqdn, service, hints, info );
++#else
+             ret = do_getaddrinfo( NULL, service, hints, info );
++#endif
+             if (!ret && hints && (hints->ai_flags & AI_CANONNAME) && *info && !(*info)->ai_canonname)
+             {
+                 freeaddrinfo( *info );
+diff --git a/dlls/ws2_32/socket.c b/dlls/ws2_32/socket.c
+index 934e4fc..ac3ba4a 100644
+--- a/dlls/ws2_32/socket.c
++++ b/dlls/ws2_32/socket.c
+@@ -3440,6 +3440,11 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
+                 return SOCKET_ERROR;
+             }
+             value = *(DWORD*)optval;
++            if (value > 0xff)
++            {
++                SetLastError( WSAEINVAL );
++                return SOCKET_ERROR;
++            }
+             return server_setsockopt( s, IOCTL_AFD_WINE_SET_TCP_KEEPCNT, (char*)&value, sizeof(value) );
+
+         case TCP_KEEPINTVL:
+@@ -3492,12 +3497,14 @@ int WINAPI setsockopt( SOCKET s, int level, int optname, const char *optval, int
+             return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_MULTICAST_IF, optval, optlen );
+
+         case IP_MULTICAST_LOOP:
+-            if (!optlen)
++            if (!optlen || !optval)
+             {
+                 SetLastError( WSAEFAULT );
+                 return -1;
+             }
+-            return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_MULTICAST_LOOP, optval, optlen );
++            memcpy( &value, optval, min( optlen, sizeof(value) ));
++            value = !!value;
++            return server_setsockopt( s, IOCTL_AFD_WINE_SET_IP_MULTICAST_LOOP, (char *)&value, sizeof(value) );
+
+         case IP_MULTICAST_TTL:
+             if (!optlen)
+diff --git a/server/sock.c b/server/sock.c
+index 0337d8d..6c5357e 100644
+--- a/server/sock.c
++++ b/server/sock.c
+@@ -3375,7 +3375,8 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+         else
+             ret = setsockopt( unix_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse) );
+ #ifdef __APPLE__
+-        if (!ret) ret = setsockopt( unix_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse) );
++        if (!ret && !is_tcp_socket( sock ))
++            ret = setsockopt( unix_fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse) );
+ #endif
+         if (ret)
+             set_error( sock_get_ntstatus( errno ) );

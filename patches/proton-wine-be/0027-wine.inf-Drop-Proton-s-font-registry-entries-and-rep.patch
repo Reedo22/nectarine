@@ -1,0 +1,52 @@
+From 4e0145d1a534e6d75787851ca74b77086e427f59 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 18:45:04 -0400
+Subject: [PATCH 27/29] wine.inf: Drop Proton's font registry entries and
+ replacements.
+
+They describe Proton's own font pack. Without it, the Windows Steam client's GDI
+font measurement asserts and its UI never loads; upstream Wine has neither group.
+---
+ loader/wine.inf.in | 26 --------------------------
+ 1 file changed, 26 deletions(-)
+
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index ad8174f8703..16b0a2b899b 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -534,32 +534,6 @@ HKLM,%FontSubStr%,"Times New Roman CYR,204",,"Times New Roman,204"
+ HKLM,%FontSubStr%,"Times New Roman Greek,161",,"Times New Roman,161"
+ HKLM,%FontSubStr%,"Times New Roman TUR,162",,"Times New Roman,162"
+ HKLM,System\CurrentControlSet\Hardware Profiles\Current\Software\Fonts,"LogPixels",0x10003,0x00000060
+-HKLM,%FontsNT%,"Arial (TrueType)",,"arial.ttf"
+-HKLM,%FontsNT%,"Arial Bold (TrueType)",,"arialbd.ttf"
+-HKLM,%FontsNT%,"Courier New (TrueType)",,"cour.ttf"
+-HKLM,%FontsNT%,"Courier New Bold (TrueType)",,"courbd.ttf"
+-HKLM,%FontsNT%,"Lucida Console",,"lucon.ttf"
+-HKLM,%FontsNT%,"Malgun Gothic (TrueType)",,"malgun.ttf"
+-HKLM,%FontsNT%,"Marlett (TrueType)",,"marlett.ttf"
+-HKLM,%FontsNT%,"Microsoft Sans Serif (TrueType)",,"micross.ttf"
+-HKLM,%FontsNT%,"MS Gothic (TrueType)",,"msgothic.ttc"
+-HKLM,%FontsNT%,"MS PGothic (TrueType)",,"msgothic.ttc"
+-HKLM,%FontsNT%,"MS UI Gothic (TrueType)",,"msgothic.ttc"
+-HKLM,%FontsNT%,"Microsoft YaHei (TrueType)",,"msyh.ttf"
+-HKLM,%FontsNT%,"Microsoft YaHei Bold (TrueType)",,"msyhbd.ttf"
+-HKLM,%FontsNT%,"Nirmala UI (TrueType)",,"nirmala.ttf"
+-HKLM,%FontsNT%,"SimSun (TrueType)",,"simsun.ttc"
+-HKLM,%FontsNT%,"NSimSun (TrueType)",,"simsun.ttc"
+-HKLM,%FontsNT%,"Symbol (TrueType)",,"symbol.ttf"
+-HKLM,%FontsNT%,"Tahoma (TrueType)",,"tahoma.ttf"
+-HKLM,%FontsNT%,"Tahoma Bold (TrueType)",,"tahomabd.ttf"
+-HKLM,%FontsNT%,"Times New Roman (TrueType)",,"times.ttf"
+-HKLM,%FontsNT%,"Webdings (TrueType)",,"webdings.ttf"
+-HKLM,%FontsNT%,"Wingdings (TrueType)",,"wingdings.ttf"
+-HKCU,Software\Wine\Fonts\Replacements,"Palatino Linotype",,"Times New Roman"
+-HKCU,Software\Wine\Fonts\Replacements,"Verdana",,"Times New Roman"
+-HKCU,Software\Wine\Fonts\Replacements,"Segoe UI Semibold",,"Times New Roman"
+-HKCU,Software\Wine\Fonts\Replacements,"Segoe UI",,"Times New Roman"
+ 
+ [MCI]
+ HKLM,%Mci32Str%,"AVIVideo",,"mciavi32.dll"
+-- 
+2.43.0
+

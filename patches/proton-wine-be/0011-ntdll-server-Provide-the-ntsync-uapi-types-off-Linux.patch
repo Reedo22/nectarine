@@ -1,0 +1,67 @@
+From 685114af7b642f0ec0690a495f7e70ca70098613 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:37:01 -0400
+Subject: [PATCH 11/29] ntdll, server: Provide the ntsync uapi types off Linux
+ instead of hiding the header.
+
+The inproc sync framework (and the fsync backend built on it) is compiled only
+when the ioctl definitions exist. Without a /dev/ntsync device the server falls
+back to fsync or server-side sync at runtime, as on Linux.
+---
+ dlls/ntdll/unix/ntsync_tmp.h | 9 +++++++--
+ server/ntsync_tmp.h          | 9 +++++++--
+ 2 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/ntdll/unix/ntsync_tmp.h b/dlls/ntdll/unix/ntsync_tmp.h
+index fa5244e01b1..eccd261ae2b 100644
+--- a/dlls/ntdll/unix/ntsync_tmp.h
++++ b/dlls/ntdll/unix/ntsync_tmp.h
+@@ -8,8 +8,14 @@
+ #ifndef __LINUX_NTSYNC_H
+ #define __LINUX_NTSYNC_H
+ 
+-#ifdef __linux__ /* nectarine */
++#ifdef __linux__
+ #include <linux/types.h>
++#else
++#include <stdint.h>
++#include <sys/ioctl.h>
++typedef uint32_t __u32;
++typedef uint64_t __u64;
++#endif
+ 
+ struct ntsync_sem_args {
+ 	__u32 count;
+@@ -58,4 +64,3 @@ struct ntsync_wait_args {
+ #define NTSYNC_IOC_EVENT_READ		_IOR ('N', 0x8d, struct ntsync_event_args)
+ 
+ #endif
+-#endif /* __linux__ nectarine */
+diff --git a/server/ntsync_tmp.h b/server/ntsync_tmp.h
+index fa5244e01b1..eccd261ae2b 100644
+--- a/server/ntsync_tmp.h
++++ b/server/ntsync_tmp.h
+@@ -8,8 +8,14 @@
+ #ifndef __LINUX_NTSYNC_H
+ #define __LINUX_NTSYNC_H
+ 
+-#ifdef __linux__ /* nectarine */
++#ifdef __linux__
+ #include <linux/types.h>
++#else
++#include <stdint.h>
++#include <sys/ioctl.h>
++typedef uint32_t __u32;
++typedef uint64_t __u64;
++#endif
+ 
+ struct ntsync_sem_args {
+ 	__u32 count;
+@@ -58,4 +64,3 @@ struct ntsync_wait_args {
+ #define NTSYNC_IOC_EVENT_READ		_IOR ('N', 0x8d, struct ntsync_event_args)
+ 
+ #endif
+-#endif /* __linux__ nectarine */
+-- 
+2.43.0
+

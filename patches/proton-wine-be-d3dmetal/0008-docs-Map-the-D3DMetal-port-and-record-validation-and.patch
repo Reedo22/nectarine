@@ -1,0 +1,480 @@
+From 42ac39cca511ed8b9fe1e26f8b00c748cf31d1f5 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sun, 25 Oct 2026 21:54:52 -0400
+Subject: [PATCH 08/11] docs: Map the D3DMetal port and record validation and
+ Mac checks.
+
+Document every reference hunk, existing equivalents, Proton-specific surface attachment, exact opt-in layout, and remaining runtime risks. Record the read-only linked Git metadata limitation and how to import the prepared series.
+---
+ D3DMETAL-PORT.md | 459 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 459 insertions(+)
+ create mode 100644 D3DMETAL-PORT.md
+
+diff --git a/D3DMETAL-PORT.md b/D3DMETAL-PORT.md
+new file mode 100644
+index 00000000000..e4be9b520a1
+--- /dev/null
++++ b/D3DMETAL-PORT.md
+@@ -0,0 +1,459 @@
++# D3DMetal port from CrossOver 26
++
++Target: Nectarine's `d3dmetal` branch, starting at `8d038d8c9bc` (Proton
++bleeding-edge Wine 11 plus the existing macOS commits). Reference: the supplied
++read-only, flattened `../cxwine-ref` source directories. No Apple binaries or
++source from other CrossOver directories are included.
++
++The runtime opt-in is the exact, case-sensitive value
++`CX_ACTIVE_GRAPHICS_BACKEND=d3dmetal`. The Unix bridge additionally uses
++`CX_APPLEGPTK_LIBD3DSHARED_PATH`. Set these before starting Wine. All new host
++specific behavior is restricted to Apple/x86_64. PE code cannot use `__APPLE__`
++(the PE compiler targets Windows); its small compatibility hooks use x86_64 and
++an explicit environment check instead. Existing exports and unused callbacks
++remain available without changing the selected graphics backend.
++
++## Hunk inventory and disposition
++
++Each subsection identifies a reference hunk or tightly coupled definition/use
++pair, its destination, and the equivalent present before this series. Paths in
++this section are target paths; remove `dlls/` to locate the flattened reference.
++
++### 1. ntdll/loader.c: native PE load notification (22434)
++
++After loading a non-builtin x86_64 PE image, pass its mapped address range to the
++Unix side. Destination: `dlls/ntdll/loader.c`. No previous equivalent. Keep the
++PE-side architecture guard; the Unix implementation gates all effects on the
++backend, Apple host, and supported OS.
++
++### 2. ntdll/unixlib.h: notification parameters and Unix call index
++
++Carry the start/end pointers and declare `unix_pe_module_loaded`. No previous
++equivalent. Append to Proton's existing Unix call enumeration, preserving all
++Proton-specific entries and their indices; do not replace the reference's whole
++enumeration. Both native and WoW64 tables must agree with that enumeration.
++
++### 3. ntdll/unix/loader.c: libd3dshared and Rosetta registration (22434)
++
++On Darwin 23/macOS 14 or newer, load the explicitly supplied dylib once, resolve
++`supports_non_native_code_regions` and `register_non_native_code_region`, and
++register native PE mappings when supported. Record the dylib's Mach-O `__TEXT`
++range for the ABI dispatchers below. No equivalent. The port requires both
++environment variables, uses explicit `RTLD_NOW | RTLD_LOCAL`, checks both
++optional functions before calling them, and validates the text segment.
++
++### 4. ntdll/unix/loader.c: native and WoW64 dispatch tables
++
++Append the notification handler to the native x86_64 table and a no-op/status
++stub to the matching 64-bit host's WoW64 table. No equivalent. A non-Apple
++x86_64 handler returns `STATUS_NOT_IMPLEMENTED`; no dylib loading is attempted.
++
++### 5. ntdll/loader.c and ntdll.spec: __wine_unix_call export (22435)
++
++Apple's PE DLLs import the public `__wine_unix_call` entry point. Already present
++as `compat___wine_unix_call` in Proton, with the same signature and forwarding
++behavior. No duplicate export or wrapper is added.
++
++### 6. ntdll Unix-library lookup and unixlib.h ABI
++
++Existing `load_unixlib_by_name` replaces the PE extension with `.so` and searches
++the architecture Unix directory; `NtQueryVirtualMemory`/the existing Unixlib
++machinery resolves its dispatch table. This already supports symlinks to a
++single dylib. The path variable in hunk 3 enables Rosetta/ABI support; it does
++not replace this search or automatically select Apple's PE DLLs. No changes
++needed to `include/wine/unixlib.h` or the normal library search. The older
++reference names `MemoryWineUnixFuncs`/`MemoryWineUnixWow64Funcs` and Proton
++names `MemoryWineLoadUnixLib`/`MemoryWineLoadUnixLibWow64` retain numeric values
++1000/1001 and the same module-to-function-table query contract.
++
++### 7. ntdll/unix/unix_private.h: mixed ABI dispatch (23015)
++
++The supplied dylib calls selected ntdll Unix exports with the Microsoft x64 ABI,
++while Wine's Unix callers use SysV. The reference checks the caller return
++address against the dylib text range, then jumps to the matching implementation.
++No equivalent. Keep Apple/x86_64 guards and preserve the registers used during
++the check; an unset range always takes the original SysV route.
++
++### 8. ntdll/unix/server.c: NtClose thunk (23015)
++
++Rename only the Unix implementation through `GPT_IMPORT` and add an `ms_abi`
++forwarder plus dispatcher. No equivalent. Keep Proton's actual close logic.
++
++### 9. ntdll/unix/sync.c: semaphore thunks (23015)
++
++Apply the same dispatch to `NtCreateSemaphore` and `NtReleaseSemaphore`. No
++equivalent. Preserve Proton synchronization implementations and fast paths.
++
++### 10. ntdll/unix/sync.c: event thunks (23015)
++
++Apply it to `NtCreateEvent`, `NtSetEvent`, `NtResetEvent`, `NtClearEvent`, and
++`NtPulseEvent`. No equivalent. Internal SysV calls still use the normal route.
++
++### 11. ntdll/unix/thread.c: NtCreateThreadEx thunk (23015)
++
++Forward all eleven arguments with the correct calling convention; do not
++replace Proton's thread setup implementation. No equivalent.
++
++### 12. winemac.drv/d3dmetal.c: exported function table (22435)
++
++Add the 24-pointer, 192-byte `macdrv_functions` data export Apple resolves from
++`winemac.so`. It provides display initialization, window data, Metal objects,
++main-thread dispatch, registry and USER operations. No equivalent. Preserve
++field order and x86_64 ABI assertions. This is a Unix data export, not a PE
++`.spec` export. Gate swapchain window-data creation on backend selection.
++
++### 13. winemac.drv/d3dmetal.c: legacy window data adapter
++
++Translate current `macdrv_win_data` into Apple's 120-byte legacy layout;
++create a current Wine client surface per swapchain and expose its Cocoa view.
++Store the locked current window data in a spare legacy slot until release.
++Existing client-surface and Metal object APIs provide the underlying mechanics,
++but this compatibility layout and hand-off are missing. Preserve creation
++before taking the window-data lock, and handle allocation failures. Unlike
++CrossOver, Proton no longer attaches surfaces in `client_surface_create`.
++Expose the existing `add_window_client_surface` helper through
++`include/wine/gdi_driver.h` (move its declaration out of
++`dlls/win32u/win32u_private.h`) and explicitly attach only bridge-created
++surfaces before taking the window-data lock. This preserves the normal
++Vulkan/OpenGL attachment paths and makes resize/detach work for D3DMetal.
++
++### 14. winemac.drv/d3dmetal.c: registry and USER wrappers
++
++Bridge ANSI registry calls back to PE advapi32 with `KeUserDispatchCallback`;
++wrap monitor/window APIs with win32u equivalents and expose `OnMainThread`.
++No equivalent table. These are the reference's ABI adapters, not additional
++registry-device enumeration logic. The PE callbacks use the Windows calling convention; the table wrappers use
++the Unix convention (`WINAPI` is empty under `WINE_UNIX_LIB`), as supplied.
++
++### 15. winemac.drv/unixlib.h: registry callback parameters
++
++Add three callback addresses to `init_params` and structures for create/open,
++query, and set-value calls. No equivalent. Unlike the reference, use `UINT64`
++for every result pointer: `UINT32 result` truncates x86_64 stack addresses.
++This is an internal PE/Unix contract, not Apple's external function-table ABI.
++
++### 16. winemac.drv/dllmain.c: PE registry callbacks
++
++Include winreg definitions, implement the three advapi32 callback handlers,
++and pass their addresses at initialization. No equivalent. No callbacks run
++until the D3DMetal table invokes them.
++
++### 17. winemac.drv/macdrv_main.c and macdrv.h: callback plumbing
++
++Declare/store the callback addresses, and propagate them through `wow64_init`
++so the shared initialization structure remains consistent. No equivalent.
++Also cache the host backend opt-in before Cocoa creates any Metal layers.
++
++### 18. winemac.drv/Makefile.in: bridge sources and imports
++
++Add `d3dmetal.c` (Unix pragma), `d3dmetal_objc.m` (Objective-C Unix source),
++and delayed advapi32 imports for the PE callbacks. Existing AppKit/Metal/
++QuartzCore link flags suffice. Do not import unrelated CrossOver icon sources.
++
++### 19. winemac.drv/macdrv.h and window.c: surface ownership
++
++Keep the swapchain client surfaces in a per-window CF array, releasing them
++when the window is destroyed. No equivalent ownership list; existing Wine
++client-surface detach logic is retained. Like the reference, this retains
++surfaces until window destruction, not until swapchain destruction.
++
++### 20. winemac.drv/cocoa_window.m: view association
++
++Add a client-surface pointer to `WineContentView` and getter/setter helpers so
++a Metal backing layer can identify its Wine surface. No equivalent. The
++pointer is only set by the D3DMetal bridge. Serialize changes on the Cocoa
++thread and clear it before detaching/disposing the view.
++
++### 21. winemac.drv/cocoa_window.m: backing-layer selection
++
++CrossOver unconditionally substitutes `WineMetalLayer` for `CAMetalLayer`.
++The port selects the subclass only for explicit D3DMetal on x86_64; default
++DXVK/MoltenVK and other architectures retain the original backing-layer class.
++
++### 22. winemac.drv/d3dmetal_objc.h and d3dmetal_objc.m
++
++Add `WineMetalLayer`, overriding `nextDrawable` to queue a presentation event
++for the associated client surface before obtaining the normal drawable. No
++equivalent. This lets win32u update/display the correct client surface for a
++swapchain that bypasses Wine's Vulkan/OpenGL presentation paths. The port
++inspects Cocoa views on the main thread, retains the event's surface, and
++releases it from `cocoa_event.m` even when events are discarded. This is a
++port-side lifetime fix; the reference queues an unowned pointer. Calling
++`nextDrawable` on the main thread executes the inspection directly.
++
++### 23. winemac.drv/macdrv_cocoa.h: presentation event and declarations
++
++Add `CLIENT_SURFACE_PRESENTED`, its payload, and bridge helper declarations.
++No equivalent. Keep enum/debug-name ordering consistent and remain within the
++event-mask bit width; avoid importing CrossOver's separate Edit menu events.
++
++### 24. winemac.drv/event.c: presentation dispatch
++
++Add the debug name, include the event in `QS_POSTMESSAGE` processing, and call
++`client_surface_present` through the bridge handler. No equivalent. The handler
++must exist on every architecture on which the event switch is compiled.
++
++### 25. win32u/d3dkmt.c: LUID-based adapter opening
++
++`NtGdiDdDDIOpenAdapterFromLuid` already creates a handle even without a matching
++Vulkan physical device, as the reference does. Device creation and queries
++already work with that handle. No D3DMetal-specific LUID generator is present
++in the reference. Preserve this path and Proton's WDDM version reporting.
++
++### 26. win32u/d3dkmt.c: hardware scheduling (24905)
++
++CrossOver reports all three hardware-scheduling bits for explicit D3DMetal.
++Proton already has NVIDIA/Vulkan-specific WDDM 2.7 handling. Add a guarded Apple
++D3DMetal branch before the Vulkan-device requirement, validate the output size,
++and initialize all bits there. Leave the existing non-D3DMetal branch intact.
++
++### 27. win32u/sysparams.c and winemac.drv/display.c: device registry
++
++The existing display-device path creates GPU registry properties (including
++GPU LUID), monitor-to-GPU links, and Vulkan UUID/LUID mappings. The reference
++uses the same baseline machinery. No additional D3DMetal device registry
++population hunk was found; do not replace it wholesale.
++
++### 28. setupapi/devinst.c: GPU LUID helpers (23560)
++
++Diablo IV expects the SetupAPI GPU LUID to match Apple's DXGI adapter zero.
++Add the property key, executable-name check, and dynamic DXGI factory/adapter
++query. No equivalent. Replace CrossOver's version-resource heuristic (which
++can misidentify missing/other dxgi.dll files) with the exact backend variable;
++no new version.dll import is needed. Retain the single-GPU limitation.
++
++### 29. setupapi/devinst.c: SetupDiGetDevicePropertyW result override
++
++After a successful, correctly sized GPU-LUID property query for Diablo IV,
++substitute the DXGI LUID; retain the registry result on DXGI failure. No
++equivalent. Do not rewrite registry state or change other applications' LUIDs.
++This does not generalize identity matching to every SetupAPI/CM API.
++
++### 30. wined3d/adapter_gl.c: CS2 D3D9 driver identity (23042)
++
++CS2 queries its driver version through D3D9 even when rendering with D3D11.
++For Apple's OpenGL fallback incorrectly identified as NVIDIA 8800 GTX,
++CrossOver substitutes AMD RX 480 to match D3DMetal's vendor. No equivalent.
++Keep the executable/vendor/device tests and add explicit D3DMetal gating.
++Correct the reference's `GetModuleFileNameW` length to an element count.
++
++### 31. loader/wine.inf.in: fake DLLs (22435)
++
++CrossOver unconditionally installs `atidxx64.dll`, `nvapi64.dll`, and
++`nvngx.dll` placeholders in `FakeDllsWin64`. No equivalent for this group.
++Unconditional prefix changes conflict with the requested inert default. Put
++them in a separate, explicitly invoked `D3DMetal` install section instead;
++normal prefix initialization does not install them. See the test setup below.
++
++### 32. win32u/vulkan.c: backend-dependent Vulkan library (25909)
++
++The only matching environment hunk selects `CX_LIBVULKAN` when the backend is
++`wined3d`, not `d3dmetal`. It is not a D3DMetal dependency and is deliberately
++not ported. Existing MoltenVK lookup stays intact.
++
++### 33. Remaining supplied directories and unrelated hacks
++
++Searched all supplied `include`, `loader`, `ntdll`, `winemac.drv`, `win32u`,
++`setupapi`, `wined3d`, `winevulkan`, `d3d12`, `dxgi`, and `gdi32` sources for the
++named markers and transitive symbols. No further D3DMetal hunks were found in
++the latter graphics DLLs or public headers. CrossOver Edit-menu, application
++identity, icon, gamma, binary-patching, write-copy, and other unrelated hacks
++are excluded. Dependency numbers added to the original inventory are 23015,
++23042, and 24905; 25909 is a reviewed non-dependency.
++
++## Validation and Mac testing
++
++No Mac build or execution was possible in this workspace. These are local
++compile/structure checks, not evidence that D3DMetal renders successfully.
++
++### Checks completed locally
++
++- Generated the build prerequisites with `autoconf`, `autoheader`,
++  `tools/make_requests`, `tools/make_specfiles`, and
++  `dlls/winevulkan/make_vulkan -x vk.xml -X video.xml` using this tree's own XML.
++  Configured an out-of-tree Linux x86_64 build with
++  `--enable-win64 --without-x --without-wayland`.
++- Successfully compiled `dlls/ntdll/unix/{loader,server,sync,thread}.o`,
++  `dlls/ntdll/x86_64-windows/loader.o`, `dlls/win32u/{d3dkmt,window}.o`,
++  `dlls/setupapi/x86_64-windows/devinst.o`, and
++  `dlls/wined3d/x86_64-windows/adapter_gl.o`. The final compile log has no
++  compiler warnings/errors. These compile out Mac-only ntdll behavior.
++- Cross-compiled `winemac.drv/dllmain.c` with `x86_64-w64-mingw32-gcc`, Wine
++  headers, `__WINESRC__`, and `__WINE_PE_BUILD`, including the new PE callbacks.
++- Syntax-checked `win32u/d3dkmt.c` with `__APPLE__` defined on the Linux host,
++  exercising the added capability branch; it needs no Apple SDK declarations.
++- Extracted the actual `GPT_ABI_WRAPPER` macro and its nine invocations and
++  assembled them with `clang-18 -target x86_64-apple-macos14 -c`. Result:
++  an x86_64 Mach-O object. This checks assembler syntax/relocations, not dyld
++  export resolution or linked Mac thunk implementations.
++- Exercised the same dispatcher macro on x86_64 Linux with SysV and explicitly
++  declared Microsoft-ABI entry aliases. An eleven-argument harness passed for
++  an unset dylib range, an in-range Microsoft caller, and both out-of-range
++  cases, checking register and stack argument delivery.
++- Compiled extracted external ABI declarations against Wine's Windows types:
++  192-byte function table, 120-byte window data, client-view offset 24,
++  padding offset 104, and all three 64-bit callback result pointers.
++- Ran the actual `tools/makedep` on a temporary Makefile with macdrv enabled.
++  Both bridge sources are Unix objects, the Objective-C header is a dependency,
++  and the callbacks remain in the PE object with delayed advapi32 imports.
++  The 34 Cocoa event values match the debug-name table in order and fit the mask.
++- `git diff --check` passed. Validation-generated source/header changes were
++  removed from the deliverable; no generated server protocol changes belong
++  to this series. The patch series was checked by applying each patch to a
++  fresh index at the base commit and comparing the resulting tree.
++
++The temporary build/check artifacts and logs are under
++`/tmp/nectarine-d3dmetal-check`. The three tests using extracted declarations
++or assembly do not substitute for compiling the complete Mac sources.
++
++### Mac build and runtime checks still required
++
++1. Build and link the whole x86_64 Wine distribution with the real Mac SDK,
++   including winemac's Objective-C and Blocks code. Check `winemac.so` exports
++   `macdrv_functions`, win32u exports `add_window_client_surface`, ntdll exports
++   all nine mixed-ABI entry points, and the PE ntdll still exports
++   `__wine_unix_call`. Check the Mach-O linker does not hide/strip the assembly
++   dispatchers or alter their calling conventions. Also build any supported
++   arm64/32-bit configurations to check the guards and WoW64 initialization.
++2. Under Rosetta on the M1 Pro with macOS 14 or newer, confirm the chosen
++   `libd3dshared.dylib` loads, its dependency on `D3DMetal.framework` resolves,
++   its text bounds are correct, and native PE images are registered. Confirm
++   the supplied Apple version exports both optional registration functions.
++   Older macOS versions are deliberately skipped, as in CrossOver.
++3. Confirm Apple's PE DLLs resolve their Unix halves through the `.so`
++   symlinks and obtain the expected `macdrv_functions` layout. Exercise all
++   registry callbacks, especially with result pointers above 4 GiB. Exercise
++   actual semaphore/event/thread/close calls from libd3dshared under Rosetta;
++   return-address dispatch assumes direct calls from that dylib's text.
++4. Run the previously measured D3D12 sample/game and compare its rendered
++   output with CrossOver; then test D3D11 and the supplied D3D10 variants.
++   Verify adapter/device creation, swapchain creation, first frame, present,
++   shutdown, and repeated launches. There are no shader/compiler changes here.
++5. Exercise multiple swapchains, resizing, minimizing/restoring, fullscreen,
++   Retina scaling, child windows, reparenting, and destroying windows with
++   presentation events still queued. Check for lock-order deadlocks, use after
++   free, and event backlog. The new main-thread hop in `nextDrawable` needs
++   performance measurement. Surface references are deliberately held until
++   window destruction, so repeated swapchain recreation can retain memory.
++6. Compare DXGI adapter-zero LUID with Diablo IV's successful
++   `SetupDiGetDevicePropertyW` GPU-LUID result. Confirm DXGI lookup failure
++   retains the registry value and does not recurse through device enumeration.
++   Other APIs/apps retain baseline Wine LUIDs; this is not a system-wide
++   identity rewrite. Multiple GPUs and unusual adapter ordering remain outside
++   CrossOver's single-Apple-GPU assumption.
++7. Query WDDM 2.7 caps with valid/invalid handles and short buffers. Check the
++   three scheduling flags succeed with D3DMetal even without a Vulkan adapter.
++   Check CS2's D3D9 driver identity alongside its D3DMetal D3D11 adapter.
++8. Verify the explicit INF section creates only the three intended placeholders
++   in 64-bit system32 and does not overwrite actual installed native DLLs.
++   The optional NVAPI/NGX features still depend on the matching supplied Apple
++   DLLs; placeholders alone do not implement those APIs.
++9. Regression-test the normal DXVK/MoltenVK launch in an unchanged prefix with
++   `CX_ACTIVE_GRAPHICS_BACKEND` unset, including a run where the dylib-path
++   variable alone is set. Confirm no libd3dshared load, original CAMetalLayer,
++   unchanged GPU properties/caps, and unchanged rendered output. Also test a
++   different backend value. Keep Apple DLL overrides/search paths out of these
++   default-path runs. Test missing/invalid dylib paths and missing symbols to
++   confirm diagnostics and failure behavior without a loader crash.
++
++### Exact external layout and test environment
++
++Use a separate runtime overlay and dedicated prefix. Let `D3DMETAL_ROOT` be
++an absolute path containing the already-obtained Apple package in this layout;
++no such files are included in the repository or patches:
++
++```text
++$D3DMETAL_ROOT/
++  lib/wine/x86_64-windows/
++    d3d10.dll                 # when supplied by the Apple package
++    d3d10_1.dll               # when supplied
++    d3d10core.dll             # when supplied
++    d3d11.dll
++    d3d12.dll
++    dxgi.dll
++    nvapi64.dll               # when supplied
++    nvngx.dll                # when supplied
++    nvngx-on-metalfx.dll      # when supplied
++  lib/wine/x86_64-unix/
++    d3d10.so -> ../../external/libd3dshared.dylib
++    d3d10_1.so -> ../../external/libd3dshared.dylib
++    d3d10core.so -> ../../external/libd3dshared.dylib
++    d3d11.so -> ../../external/libd3dshared.dylib
++    d3d12.so -> ../../external/libd3dshared.dylib
++    dxgi.so -> ../../external/libd3dshared.dylib
++    nvapi64.so -> ../../external/libd3dshared.dylib
++    nvngx.so -> ../../external/libd3dshared.dylib
++    nvngx-on-metalfx.so -> ../../external/libd3dshared.dylib
++  lib/external/
++    libd3dshared.dylib
++    D3DMetal.framework/       # preserve the package's framework structure
++```
++
++Use one same-basename `.so` for each PE DLL supplied by the package; the Unix
++name is `d3d12.so`, **not** `d3d12.dll.so`. Do not manufacture missing optional
++PE DLLs. Keep the framework beside the dylib as supplied; inspect `otool -L`
++on the Mac if dyld cannot find it.
++
++For the installed patched x86_64 Wine (replace paths with local absolute paths):
++
++```sh
++export NECTARINE_ROOT=/absolute/path/to/patched-wine
++export D3DMETAL_ROOT=/absolute/path/to/apple-runtime-overlay
++export WINEPREFIX="$HOME/nectarine-prefixes/d3dmetal-test"
++export WINEARCH=win64
++export CX_ACTIVE_GRAPHICS_BACKEND=d3dmetal
++export CX_APPLEGPTK_LIBD3DSHARED_PATH="$D3DMETAL_ROOT/lib/external/libd3dshared.dylib"
++export WINEDLLPATH="$D3DMETAL_ROOT/lib/wine"
++export WINEDLLOVERRIDES='d3d10,d3d10_1,d3d10core,d3d11,d3d12,dxgi=b'
++
++arch -x86_64 "$NECTARINE_ROOT/bin/wine" wineboot -u
++INF_WIN=$(arch -x86_64 "$NECTARINE_ROOT/bin/wine" winepath -w "$NECTARINE_ROOT/share/wine/wine.inf")
++arch -x86_64 "$NECTARINE_ROOT/bin/wine" cmd.exe /d /s /c "rundll32.exe setupapi,InstallHinfSection D3DMetal 128 $INF_WIN"
++
++WINEDEBUG=+loaddll,+module,+macdrv_d3dmtl \
++  arch -x86_64 "$NECTARINE_ROOT/bin/wine" /absolute/path/to/d3d12-test.exe
++```
++
++The overlay is first in Wine's builtin search path; `=b` selects the supplied
++PEs there and their associated Unix libraries. Verify their resolved paths in
++`+loaddll` output, particularly if the application directory or prefix already
++contains DXVK/native copies. Retain the launcher's existing overlay selection
++if it already establishes this exact layout. Add
++`;nvapi64,nvngx,nvngx-on-metalfx=b` to the override only for optional DLLs
++actually supplied and needed for the test. `atidxx64.dll` is a probe placeholder,
++not another implementation to force-load. Override `d3d12core` only if the
++chosen Apple package actually supplies it; it is not assumed by this port.
++
++The INF step is explicit to keep default prefix updates inert. Its contents
++persist in that test prefix. For DXVK/MoltenVK regression runs use the existing
++normal prefix and launcher, with both CX variables and these Apple-specific
++`WINEDLLPATH`/DLL overrides absent. Setting the backend variable alone does not
++install or select Apple's DLLs, and setting only the dylib path does not opt in.
++
++### Patch-series delivery in this restricted worktree
++
++Source edits are present in this working directory. The original worktree's
++metadata resolves to `~/nectarine-work/pwine/.git`, which the session
++mounts read-only: `git add` failed to create `index.lock`. Consequently the
++original `d3dmetal` ref could not be advanced here. No protected metadata was
++modified. Commits were made on `d3dmetal` in the writable companion Git directory
++`/tmp/nectarine-d3dmetal-series.git`, using the original object database read-only.
++
++The standalone transfer files are `/tmp/nectarine-d3dmetal-series.bundle` and
++`/tmp/nectarine-d3dmetal-patches/*.patch`, based on `8d038d8c9bc`. The bundle is
++incremental and requires that base history; the format-patches can be applied
++with `git am` to a clean checkout at that base. They contain the source changes
++and this document, not validation outputs or Apple files.
++
++Once the original metadata is writable, while still on this `d3dmetal` branch
++with the completed source edits intact, import the commits and align the index
++without discarding the working files:
++
++```sh
++git fetch /tmp/nectarine-d3dmetal-series.bundle d3dmetal
++git reset --mixed FETCH_HEAD
++git status --short
++```
++
++Do not `git am` over the already edited working tree; use the bundle procedure
++above or apply the patches to a separate clean checkout.
+-- 
+2.43.0
+

@@ -1,0 +1,37 @@
+From f1ced949a368a52a6ff41199809444ddeb58802e Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:14:27 -0400
+Subject: [PATCH 09/29] ntdll: Provide non-Linux fallbacks for the CPU override
+ sysfs helpers.
+
+---
+ dlls/ntdll/unix/system.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index 3a21539f66c..91058293e63 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -843,6 +843,19 @@ void init_shared_data_cpuinfo( KUSER_SHARED_DATA *data )
+ static void fill_performance_core_info(void);
+ static BOOL sysfs_parse_bitmap(const char *filename, ULONG_PTR *mask);
+ 
++#ifndef linux
++/* Proton's CPU override helpers read Linux sysfs; elsewhere report no topology
++ * information, so a plain count override still works and "p" finds no P-cores. */
++static void fill_performance_core_info(void)
++{
++}
++
++static BOOL sysfs_parse_bitmap(const char *filename, ULONG_PTR *mask)
++{
++    return FALSE;
++}
++#endif
++
+ static ULONG popcount( ULONG val )
+ {
+ #if defined(__MINGW32__)
+-- 
+2.43.0
+

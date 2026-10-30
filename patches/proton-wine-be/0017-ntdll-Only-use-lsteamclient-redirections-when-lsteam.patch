@@ -1,0 +1,39 @@
+From 4cb9bcbdf02ea4449a08b716236f359b5a950239 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 15:05:51 -0400
+Subject: [PATCH 17/29] ntdll: Only use lsteamclient redirections when
+ lsteamclient.dll is installed.
+
+Otherwise the real Windows steamclient(64).dll gets its tier0/vstdlib imports
+redirected to ntdll and fails to initialise, which breaks the Windows Steam
+client running inside the prefix (the macOS case).
+---
+ dlls/ntdll/loader.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index 52b6e70585c..16873540e95 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -1159,6 +1159,18 @@ static int use_lsteamclient(void)
+     use = !get_env( L"PROTON_DISABLE_LSTEAMCLIENT", env, sizeof(env) ) || *env == '0';
+     if (!use)
+         ERR("lsteamclient disabled.\n");
++    else
++    {
++        /* Without the lsteamclient bridge (e.g. on macOS, where the real Windows Steam
++         * client runs in the prefix), redirecting the tier0/vstdlib imports of steamclient
++         * to ntdll breaks the client ("InternalAPI_Init_Internal failed"). */
++        WCHAR path[MAX_PATH];
++
++        wcscpy( path, system_dir );
++        wcscat( path, L"lsteamclient.dll" );
++        if (!(use = RtlDoesFileExists_U( path )))
++            TRACE( "lsteamclient.dll not installed, leaving steamclient alone.\n" );
++    }
+     return use;
+ }
+ 
+-- 
+2.43.0
+

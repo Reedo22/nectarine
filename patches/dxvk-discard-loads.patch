@@ -1,0 +1,23 @@
+Nectarine: optional discard of colour attachment loads (DXVK 1.10.x / Gcenx DXVK-macOS)
+
+DXVK hardcodes VK_ATTACHMENT_LOAD_OP_LOAD for every colour attachment, so on a
+tile-based GPU every render pass reads back a target it may be about to overwrite.
+Gated behind DXVK_X_DISCARD_LOADS=1.
+
+STATUS: verified to work (attachment loads drop to zero, tile traffic halves), but only
+measured on a synthetic benchmark, where it gained ~2% because that test is fill-rate
+bound. NOT yet validated on a real game -- our from-source DXVK builds run the synthetic
+probe but fail to host real games (see README, Known issues). Unsafe as a blanket
+setting: passes that blend onto existing contents will start from undefined contents.
+
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ resetRenderPassOps
+       if (renderTargets.color[i].view != nullptr) {
++        // NECTARINE: skip the attachment load on tile GPUs when enabled.
++        static const int discardLoads = getenv("DXVK_X_DISCARD_LOADS") ? 1 : 0;
+         renderPassOps.colorOps[i] = DxvkColorAttachmentOps {
+-            VK_ATTACHMENT_LOAD_OP_LOAD,
++            discardLoads ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD,
+             renderTargets.color[i].layout,
+             renderTargets.color[i].layout };

@@ -1,0 +1,121 @@
+From 033af2fddb5376a08e333e96f3226e7caaa7f8ad Mon Sep 17 00:00:00 2001
+From: Reedo22 <141674188+Reedo22@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 20:12:23 -0400
+Subject: [PATCH] ntdll,winemac: Add an isolated DXMT D3D11 backend to the
+ unified engine
+
+---
+ dlls/ntdll/unix/loader.c       | 48 +++++++++++++++++++++++++++++-----
+ dlls/winemac.drv/macdrv_main.c |  4 ++-
+ 2 files changed, 44 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 9a26e885bc6..41ee9e79b7f 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -137,8 +137,8 @@ SECTION_IMAGE_INFORMATION main_image_info = { NULL };
+ #if defined(__APPLE__) && defined(__x86_64__)
+ /* Selected once in __wine_main(), before any Wine thread enters PE code. */
+ BOOL use_macos_pthread_gsbase;
+-/* engine directory with Apple's D3DMetal builtins; searched before dll_dir in D3DMetal processes */
+-static char *d3dmetal_dll_dir;
++/* Selected backend builtins, searched before the default engine DLL directory. */
++static char *graphics_dll_dir;
+ #endif
+ 
+ /* die on a fatal error; use only during initialization */
+@@ -322,7 +322,7 @@ static void set_dll_path(void)
+     dll_paths = malloc( (count + 3) * sizeof(*dll_paths) );
+     count = 0;
+ 
+-    if (d3dmetal_dll_dir) dll_paths[count++] = d3dmetal_dll_dir;
++    if (graphics_dll_dir) dll_paths[count++] = graphics_dll_dir;
+     if (!build_dir) dll_paths[count++] = dll_dir;
+ 
+     if (path)
+@@ -2953,9 +2953,13 @@ static void select_graphics_backend( int argc, char *argv[] )
+ {
+     const char *mode = getenv( "NECTARINE_D3D12" ), *dir = getenv( "NECTARINE_D3DMETAL_DIR" );
+     const char *image = getenv( "WINE_NECTARINE_IMAGE" );
+-    BOOL d3dmetal;
++    const char *d3d11 = getenv( "NECTARINE_D3D11" );
++    BOOL d3dmetal, force_d3d11 = FALSE, force_d3d12 = FALSE;
+     int i;
+ 
++    if (d3d11 && strcmp( d3d11, "dxmt" ) && strcmp( d3d11, "dxvk" ) &&
++        strcmp( d3d11, "d3dmetal" )) d3d11 = NULL;
++
+     /* "auto": D3DMetal for D3D12 games; "always": for every process (D3DMetal also does D3D10/11) */
+     if (!mode || (strcmp( mode, "auto" ) && strcmp( mode, "always" )) || !dir || !*dir) return;
+     if (!image && argc > 1) image = argv[1];  /* first process: unix path, relative to cwd */
+@@ -2963,12 +2967,39 @@ static void select_graphics_backend( int argc, char *argv[] )
+                (image && (pe_imports_d3d12( image ) || ships_d3d12_runtime( image )));
+     /* Games that load D3D12 at runtime (Unreal, Unity) don't import it; the standard -dx12 /
+      * -d3d12 switch (e.g. Steam launch options) asks for D3D12, and thus D3DMetal, explicitly. */
+-    for (i = 1; !d3dmetal && i < argc; i++)
+-        if (!strcasecmp( argv[i], "-dx12" ) || !strcasecmp( argv[i], "-d3d12" )) d3dmetal = TRUE;
++    for (i = 1; i < argc; i++)
++    {
++        if (!strcasecmp( argv[i], "-dx12" ) || !strcasecmp( argv[i], "-d3d12" ) ||
++            !strcasecmp( argv[i], "-force-d3d12" )) force_d3d12 = TRUE;
++        if (!strcasecmp( argv[i], "-dx11" ) || !strcasecmp( argv[i], "-d3d11" ) ||
++            !strcasecmp( argv[i], "-force-d3d11" )) force_d3d11 = TRUE;
++    }
++    /* An explicit D3D11 RHI permits testing even an Agility-capable game. Keep the
++     * existing heuristic when no D3D11 override is requested. D3D12 always wins. */
++    if (force_d3d12) d3dmetal = TRUE;
++    else if (d3d11 && force_d3d11 && strcmp( mode, "always" )) d3dmetal = FALSE;
++    if (!d3dmetal && d3d11)
++    {
++        if (!strcmp( d3d11, "dxmt" ))
++        {
++            const char *dxmt_dir = getenv( "NECTARINE_DXMT_DIR" );
++            if (dxmt_dir && *dxmt_dir && !access( dxmt_dir, R_OK | X_OK ))
++            {
++                if (getenv( "NECTARINE_GRAPHICS_TRACE" ))
++                    fprintf( stderr, "wine: graphics=dxmt dir=%s image=%s\n", dxmt_dir, image ? image : "" );
++                graphics_dll_dir = strdup( dxmt_dir );
++                setenv( "CX_ACTIVE_GRAPHICS_BACKEND", "dxmt", 1 );
++                return;
++            }
++            fprintf( stderr, "wine: DXMT directory unavailable; using default backend\n" );
++        }
++        else if (!strcmp( d3d11, "d3dmetal" )) d3dmetal = TRUE;
++        /* dxvk and unknown values retain the engine's default DXVK DLLs. */
++    }
+     if (d3dmetal)
+     {
+         setenv( "CX_ACTIVE_GRAPHICS_BACKEND", "d3dmetal", 1 );
+-        d3dmetal_dll_dir = strdup( dir );
++        graphics_dll_dir = strdup( dir );
+     }
+     else
+     {
+@@ -2976,6 +3007,9 @@ static void select_graphics_backend( int argc, char *argv[] )
+         if (def && *def) setenv( "CX_ACTIVE_GRAPHICS_BACKEND", def, 1 );
+         else unsetenv( "CX_ACTIVE_GRAPHICS_BACKEND" );
+     }
++    if (getenv( "NECTARINE_GRAPHICS_TRACE" ))
++        fprintf( stderr, "wine: graphics=%s dir=%s image=%s\n", d3dmetal ? "d3dmetal" : "dxvk",
++                 graphics_dll_dir ? graphics_dll_dir : "default", image ? image : "" );
+     /* WINE_NECTARINE_IMAGE is kept: the loader may re-exec itself and must decide the same way;
+      * spawn_process() overwrites it for every child. */
+ }
+diff --git a/dlls/winemac.drv/macdrv_main.c b/dlls/winemac.drv/macdrv_main.c
+index 814f99b9489..94cb5c3f110 100644
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -435,7 +435,9 @@ static NTSTATUS macdrv_init(void *arg)
+ #if defined(__APPLE__) && defined(__x86_64__)
+     const char *backend = getenv("CX_ACTIVE_GRAPHICS_BACKEND");
+ 
+-    d3dmetal_enabled = backend && !strcmp(backend, "d3dmetal");
++    /* DXMT consumes the same exported Metal-view/client-surface bridge.
++     * This flag does not select Apple libraries or ntdll's GS-base mode. */
++    d3dmetal_enabled = backend && (!strcmp(backend, "d3dmetal") || !strcmp(backend, "dxmt"));
+ #endif
+ 
+     app_icon_callback = params->app_icon_callback;
+-- 
+2.43.0
+

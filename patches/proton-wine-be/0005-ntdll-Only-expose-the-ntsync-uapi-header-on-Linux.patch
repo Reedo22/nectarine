@@ -1,0 +1,31 @@
+From a5aa624bd12731880f6dc4c44827094445d61310 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 12:51:18 -0400
+Subject: [PATCH 05/29] ntdll: Only expose the ntsync uapi header on Linux.
+
+Without it NTSYNC_IOC_* stay undefined and the in-process sync paths
+compile out, as with upstream's HAVE_LINUX_NTSYNC_H.
+---
+ dlls/ntdll/unix/ntsync_tmp.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/dlls/ntdll/unix/ntsync_tmp.h b/dlls/ntdll/unix/ntsync_tmp.h
+index 6d06793512b..fa5244e01b1 100644
+--- a/dlls/ntdll/unix/ntsync_tmp.h
++++ b/dlls/ntdll/unix/ntsync_tmp.h
+@@ -8,6 +8,7 @@
+ #ifndef __LINUX_NTSYNC_H
+ #define __LINUX_NTSYNC_H
+ 
++#ifdef __linux__ /* nectarine */
+ #include <linux/types.h>
+ 
+ struct ntsync_sem_args {
+@@ -57,3 +58,4 @@ struct ntsync_wait_args {
+ #define NTSYNC_IOC_EVENT_READ		_IOR ('N', 0x8d, struct ntsync_event_args)
+ 
+ #endif
++#endif /* __linux__ nectarine */
+-- 
+2.43.0
+

@@ -1,0 +1,30 @@
+From e9cc27d0b262e42dcc8e4926e8376485c8de1f22 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 16:57:14 -0400
+Subject: [PATCH 23/29] opengl32: Skip the fshack gamma shader setup on macOS.
+
+It ran on every context switch and failed to compile in legacy CGL contexts,
+while the GL fshack that would use it is never enabled on macOS.
+---
+ dlls/opengl32/unix_wgl.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/dlls/opengl32/unix_wgl.c b/dlls/opengl32/unix_wgl.c
+index 5f6449b70a8..605b66f3d34 100644
+--- a/dlls/opengl32/unix_wgl.c
++++ b/dlls/opengl32/unix_wgl.c
+@@ -1694,7 +1694,11 @@ static void make_context_current( TEB *teb, const struct opengl_funcs *funcs, HD
+     ctx->base.has_GL_ARB_fragment_program = !ctx->base.is_core && is_extension_supported( ctx, "GL_ARB_fragment_program" );
+     ctx->base.has_GL_ARB_vertex_program = !ctx->base.is_core && is_extension_supported( ctx, "GL_ARB_vertex_program" );
+     ctx->base.integer_scaling = fs_hack_is_integer();
++#ifndef __APPLE__
++    /* Only used by the GL fshack framebuffer, which is EGL-only; on macOS it is never
++     * enabled and GLSL 330 fails to compile in legacy CGL contexts. */
+     if (!ctx->base.gamma_program) fs_hack_setup_gamma_shader( &ctx->base, funcs );
++#endif
+     /* Drawable's FBO could've changed in driver. */
+     pop_default_fbo( teb );
+ }
+-- 
+2.43.0
+

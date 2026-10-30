@@ -1,0 +1,1731 @@
+      19
+From 99f427edcb843e136f7ac4d368d42e5f78dca468 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 12:51:18 -0400
+Subject: [PATCH 01/19] ntdll: Only include malloc.h on Linux.
+
+macOS has no <malloc.h>.
+---
+ dlls/ntdll/unix/loader.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index f8aa468..4163957 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -38,7 +38,9 @@
+ #include <sys/mman.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
++#ifdef __linux__
+ #include <malloc.h>
++#endif
+ #include <dlfcn.h>
+ #ifdef HAVE_PWD_H
+ # include <pwd.h>
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 8301bd49ee23353c724913f1e235178031aa2d6d Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 12:51:18 -0400
+Subject: [PATCH 02/19] ntdll: Make the early set_thread_teb() hack Linux-only.
+
+On macOS %gs holds the pthread TSD base and Wine swaps it on syscall
+entry (mac_thread_gsbase); upstream never points it at the TEB.
+---
+ dlls/ntdll/unix/signal_x86_64.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 110404c..6ac8373 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -3197,7 +3197,9 @@ void signal_init_process(void)
+ 
+ void set_thread_teb( TEB *teb )
+ {
++#ifdef __linux__
+     arch_prctl( ARCH_SET_GS, teb );
++#endif
+ }
+ 
+ /***********************************************************************
+-- 
+2.54.0 (Apple Git-157)
+
+
+From dda36770e72bee8c4978f2687df1f5a70f1f34bd Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 12:51:18 -0400
+Subject: [PATCH 03/19] winegstreamer: Include pthread.h in media-converter.h.
+
+glibc pulls it in transitively; macOS does not.
+---
+ dlls/winegstreamer/media-converter/media-converter.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/dlls/winegstreamer/media-converter/media-converter.h b/dlls/winegstreamer/media-converter/media-converter.h
+index 3dd8864..f5e6a52 100644
+--- a/dlls/winegstreamer/media-converter/media-converter.h
++++ b/dlls/winegstreamer/media-converter/media-converter.h
+@@ -28,6 +28,7 @@
+ #include <inttypes.h>
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <pthread.h>
+ #include <sys/stat.h>
+ 
+ #include "unix_private.h"
+-- 
+2.54.0 (Apple Git-157)
+
+
+From c0c6525d73f95ff90aa94139ea38c4cfe10c1f37 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 12:51:18 -0400
+Subject: [PATCH 04/19] ntdll, server: Compile fsync futex calls only on Linux.
+
+fsync_check_support() already returns 0 off Linux, so this code never
+runs on macOS; never issue raw syscall 449 there (it is a different call).
+---
+ dlls/ntdll/unix/fsync.c | 14 ++++++++++++++
+ server/fsync.c          |  5 +++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/dlls/ntdll/unix/fsync.c b/dlls/ntdll/unix/fsync.c
+index 25d41ca..0e19a08 100644
+--- a/dlls/ntdll/unix/fsync.c
++++ b/dlls/ntdll/unix/fsync.c
+@@ -141,15 +141,25 @@ static void simulate_sched_quantum(void)
+ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+         int count, const struct timespec64 *end, clockid_t clock_id )
+ {
++#ifdef __linux__
+    if (end)
+         return syscall( __NR_futex_waitv, futexes, count, 0, end, clock_id );
+    else
+         return syscall( __NR_futex_waitv, futexes, count, 0, NULL, 0 );
++#else
++   errno = ENOSYS;
++   return -1;
++#endif
+ }
+ 
+ static inline int futex_wake( int *addr, int val )
+ {
++#ifdef __linux__
+     return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
++#else
++    errno = ENOSYS;
++    return -1;
++#endif
+ }
+ 
+ struct fsync
+@@ -456,7 +466,11 @@ void fsync_init( DWORD pid )
+ 
+ 
+     fsync_enabled = 1;
++#ifdef __linux__
+     syscall( __NR_futex_waitv, NULL, 0, 0, NULL, 0 );
++#else
++    errno = ENOSYS;
++#endif
+     if (errno == ENOSYS || errno == EPERM)
+     {
+         ERR("Server is running with WINEFSYNC but this process can't use __NR_futex_waitv.\n");
+diff --git a/server/fsync.c b/server/fsync.c
+index 7d3ec64..362c406 100644
+--- a/server/fsync.c
++++ b/server/fsync.c
+@@ -310,7 +310,12 @@ int fsync_grab_shm_idx( unsigned int shm_idx )
+ 
+ static inline int futex_wake( int *addr, int val )
+ {
++#ifdef __linux__
+     return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
++#else
++    errno = ENOSYS;
++    return -1;
++#endif
+ }
+ 
+ /* shm layout for events or event-like objects. */
+-- 
+2.54.0 (Apple Git-157)
+
+
+From f1ee63da187f8c4d7118ec33cca3b2e05bae22c1 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 12:51:18 -0400
+Subject: [PATCH 05/19] ntdll: Only expose the ntsync uapi header on Linux.
+
+Without it NTSYNC_IOC_* stay undefined and the in-process sync paths
+compile out, as with upstream's HAVE_LINUX_NTSYNC_H.
+---
+ dlls/ntdll/unix/ntsync_tmp.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/dlls/ntdll/unix/ntsync_tmp.h b/dlls/ntdll/unix/ntsync_tmp.h
+index 6d06793..fa5244e 100644
+--- a/dlls/ntdll/unix/ntsync_tmp.h
++++ b/dlls/ntdll/unix/ntsync_tmp.h
+@@ -8,6 +8,7 @@
+ #ifndef __LINUX_NTSYNC_H
+ #define __LINUX_NTSYNC_H
+ 
++#ifdef __linux__ /* nectarine */
+ #include <linux/types.h>
+ 
+ struct ntsync_sem_args {
+@@ -57,3 +58,4 @@ struct ntsync_wait_args {
+ #define NTSYNC_IOC_EVENT_READ		_IOR ('N', 0x8d, struct ntsync_event_args)
+ 
+ #endif
++#endif /* __linux__ nectarine */
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 9a80fbb21630937a90cd16a3342b0bbc258f5a13 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 12:51:18 -0400
+Subject: [PATCH 06/19] win32u: Stub the GL fshack framebuffer surface without
+ EGL.
+
+Proton's fullscreen hack calls these from outside the SONAME_LIBEGL block;
+macOS has no EGL, so the hack stays disabled there.
+---
+ dlls/win32u/opengl.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/dlls/win32u/opengl.c b/dlls/win32u/opengl.c
+index 03346f5..375106e 100644
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -1600,6 +1600,32 @@ static void init_egl_platforms( struct opengl_funcs *funcs, const struct opengl_
+ 
+ #else /* SONAME_LIBEGL */
+ 
++/* The fshack framebuffer surface is only built with EGL; without it the hack is
++ * simply never enabled, as in upstream Wine. */
++struct framebuffer_surface
++{
++    struct opengl_drawable base;
++    struct opengl_drawable *target;
++};
++
++static struct framebuffer_surface *framebuffer_from_opengl_drawable( struct opengl_drawable *base )
++{
++    return CONTAINING_RECORD( base, struct framebuffer_surface, base );
++}
++
++static const struct opengl_drawable_funcs framebuffer_surface_funcs;
++
++static struct opengl_drawable *framebuffer_surface_create( int format, struct client_surface *client,
++                                                          struct opengl_drawable *target )
++{
++    return NULL;
++}
++
++static BOOL needs_framebuffer_surface( HWND hwnd )
++{
++    return FALSE;
++}
++
+ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
+ {
+     WARN( "EGL support not compiled in!\n" );
+-- 
+2.54.0 (Apple Git-157)
+
+
+From ef796f291985f576a2ce3113266a90de1ebacc30 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:03:02 -0400
+Subject: [PATCH 07/19] server: Only expose the ntsync uapi header on Linux.
+
+---
+ server/ntsync_tmp.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/server/ntsync_tmp.h b/server/ntsync_tmp.h
+index 6d06793..fa5244e 100644
+--- a/server/ntsync_tmp.h
++++ b/server/ntsync_tmp.h
+@@ -8,6 +8,7 @@
+ #ifndef __LINUX_NTSYNC_H
+ #define __LINUX_NTSYNC_H
+ 
++#ifdef __linux__ /* nectarine */
+ #include <linux/types.h>
+ 
+ struct ntsync_sem_args {
+@@ -57,3 +58,4 @@ struct ntsync_wait_args {
+ #define NTSYNC_IOC_EVENT_READ		_IOR ('N', 0x8d, struct ntsync_event_args)
+ 
+ #endif
++#endif /* __linux__ nectarine */
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 016413f815aae10473d7e22d5551b51593ab7998 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:03:02 -0400
+Subject: [PATCH 08/19] ntdll: Only call mallopt(M_PERTURB) on Linux.
+
+It is a glibc extension.
+---
+ dlls/ntdll/unix/loader.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 4163957..1b7482b 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2453,7 +2453,9 @@ static void start_main_thread(void)
+     set_thread_teb( teb );
+ #endif
+ 
++#ifdef __linux__
+     mallopt( M_PERTURB, 0xff );
++#endif
+     init_startup_info();
+     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
+     set_load_order_app_name( main_wargv[0] );
+@@ -2462,7 +2464,9 @@ static void start_main_thread(void)
+     load_ntdll();
+     load_wow64_ntdll( main_image_info.Machine );
+     load_apiset_dll();
++#ifdef __linux__
+     mallopt( M_PERTURB, 0 );
++#endif
+     server_init_process_done();
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 9339b3906906d12422e947fd17277437d019d54f Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:03:02 -0400
+Subject: [PATCH 09/19] ntdll: Use the explicit indirect form for jmp in
+ dump_syscall_fault_return.
+
+GNU as accepts "jmp %rcx" with a warning; clang's assembler rejects it.
+---
+ dlls/ntdll/unix/signal_x86_64.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 6ac8373..8ffd34d 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2279,7 +2279,7 @@ __ASM_GLOBAL_FUNC( dump_syscall_fault_return,
+                    "movq %rdi,%rsp\n\t"
+                    "movq %rsi,%rax\n\t"
+                    "movq %rdx,%r13\n\t"
+-                   "jmp %rcx")
++                   "jmp *%rcx")
+ 
+ 
+ static void dump_syscall_fault( CONTEXT *context, DWORD exc_code )
+-- 
+2.54.0 (Apple Git-157)
+
+
+From cb6a8af07ef6e34e77a69eaed7465395481b844c Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:14:27 -0400
+Subject: [PATCH 10/19] ntdll: Provide non-Linux fallbacks for the CPU override
+ sysfs helpers.
+
+---
+ dlls/ntdll/unix/system.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index 1821c6e..b1c3e6e 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -768,6 +768,19 @@ void init_shared_data_cpuinfo( KUSER_SHARED_DATA *data )
+ static void fill_performance_core_info(void);
+ static BOOL sysfs_parse_bitmap(const char *filename, ULONG_PTR *mask);
+ 
++#ifndef linux
++/* Proton's CPU override helpers read Linux sysfs; elsewhere report no topology
++ * information, so a plain count override still works and "p" finds no P-cores. */
++static void fill_performance_core_info(void)
++{
++}
++
++static BOOL sysfs_parse_bitmap(const char *filename, ULONG_PTR *mask)
++{
++    return FALSE;
++}
++#endif
++
+ static ULONG popcount( ULONG val )
+ {
+ #if defined(__MINGW32__)
+-- 
+2.54.0 (Apple Git-157)
+
+
+From bf0565deebe12c7b9fd9590e33516a4287705b8e Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:31:49 -0400
+Subject: [PATCH 11/19] server: Derive the unique local user SID from the host
+ UUID on macOS.
+
+Proton seeds it from /etc/machine-id, which macOS does not have.
+---
+ server/token.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/server/token.c b/server/token.c
+index b75a589..e4e3608 100644
+--- a/server/token.c
++++ b/server/token.c
+@@ -220,6 +220,27 @@ void init_user_sid(void)
+     size_t n;
+     FILE *f;
+ 
++#ifdef __APPLE__
++    /* No /etc/machine-id on macOS: use the first 64 bits of the hardware UUID, the
++     * same amount of identity the Linux path takes from machine-id. */
++    {
++        static const struct timespec no_wait = { 0, 0 };
++        unsigned char uuid[16];
++        unsigned int i;
++
++        if (gethostuuid( uuid, &no_wait ))
++        {
++            fprintf( stderr, "Failed to get host UUID, error %s.\n", strerror( errno ));
++            return;
++        }
++        for (id = 0, i = 0; i < 8; i++) id = (id << 8) | uuid[i];
++        local_user_sid.sub_auth[1] = id >> 32;
++        local_user_sid.sub_auth[2] = id & 0xffffffff;
++        local_user_sid.sub_auth[3] = getuid();
++        return;
++    }
++#endif
++
+     f = fopen( "/etc/machine-id", "r" );
+     if (!f)
+     {
+-- 
+2.54.0 (Apple Git-157)
+
+
+From e0d8804326356362029af402e1fa0658a64d3c76 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:37:01 -0400
+Subject: [PATCH 12/19] ntdll, server: Provide the ntsync uapi types off Linux
+ instead of hiding the header.
+
+The inproc sync framework (and the fsync backend built on it) is compiled only
+when the ioctl definitions exist. Without a /dev/ntsync device the server falls
+back to fsync or server-side sync at runtime, as on Linux.
+---
+ dlls/ntdll/unix/ntsync_tmp.h | 9 +++++++--
+ server/ntsync_tmp.h          | 9 +++++++--
+ 2 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/ntdll/unix/ntsync_tmp.h b/dlls/ntdll/unix/ntsync_tmp.h
+index fa5244e..eccd261 100644
+--- a/dlls/ntdll/unix/ntsync_tmp.h
++++ b/dlls/ntdll/unix/ntsync_tmp.h
+@@ -8,8 +8,14 @@
+ #ifndef __LINUX_NTSYNC_H
+ #define __LINUX_NTSYNC_H
+ 
+-#ifdef __linux__ /* nectarine */
++#ifdef __linux__
+ #include <linux/types.h>
++#else
++#include <stdint.h>
++#include <sys/ioctl.h>
++typedef uint32_t __u32;
++typedef uint64_t __u64;
++#endif
+ 
+ struct ntsync_sem_args {
+ 	__u32 count;
+@@ -58,4 +64,3 @@ struct ntsync_wait_args {
+ #define NTSYNC_IOC_EVENT_READ		_IOR ('N', 0x8d, struct ntsync_event_args)
+ 
+ #endif
+-#endif /* __linux__ nectarine */
+diff --git a/server/ntsync_tmp.h b/server/ntsync_tmp.h
+index fa5244e..eccd261 100644
+--- a/server/ntsync_tmp.h
++++ b/server/ntsync_tmp.h
+@@ -8,8 +8,14 @@
+ #ifndef __LINUX_NTSYNC_H
+ #define __LINUX_NTSYNC_H
+ 
+-#ifdef __linux__ /* nectarine */
++#ifdef __linux__
+ #include <linux/types.h>
++#else
++#include <stdint.h>
++#include <sys/ioctl.h>
++typedef uint32_t __u32;
++typedef uint64_t __u64;
++#endif
+ 
+ struct ntsync_sem_args {
+ 	__u32 count;
+@@ -58,4 +64,3 @@ struct ntsync_wait_args {
+ #define NTSYNC_IOC_EVENT_READ		_IOR ('N', 0x8d, struct ntsync_event_args)
+ 
+ #endif
+-#endif /* __linux__ nectarine */
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 17b8939f394d79de3320be832325a95e596b7713 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:37:30 -0400
+Subject: [PATCH 13/19] ntdll, server: Add a macOS wait/wake layer for the
+ fsync backend.
+
+macOS has a cross-process futex (os_sync_wait_on_address, 14.4+) but no
+futex_waitv. Single-address waits use it directly; multi-address waits sleep
+on a wake generation in the reserved shm slot 0 that wakers bump only while
+such waiters exist. The shm is sized once because XNU allows ftruncate() only
+once. Enabled by WINEFSYNC=1 or WINEMSYNC=1.
+
+This plays the role msync has on macOS, but plugs into Proton's existing fsync
+object logic instead of replacing it.
+---
+ dlls/ntdll/unix/fsync.c | 113 +++++++++++++++++++++++++++++++++++-----
+ server/fsync.c          |  41 +++++++++++++--
+ 2 files changed, 137 insertions(+), 17 deletions(-)
+
+diff --git a/dlls/ntdll/unix/fsync.c b/dlls/ntdll/unix/fsync.c
+index 0e19a08..eb45e0c 100644
+--- a/dlls/ntdll/unix/fsync.c
++++ b/dlls/ntdll/unix/fsync.c
+@@ -44,6 +44,10 @@
+ #endif
+ #include <unistd.h>
+ #include <stdint.h>
++#ifdef __APPLE__
++# include <os/clock.h>
++# include <os/os_sync_wait_on_address.h>
++#endif
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -138,27 +142,109 @@ static void simulate_sched_quantum(void)
+     usleep(0);
+ }
+ 
++#ifdef __APPLE__
++
++/* macOS has no futex_waitv. A wait on one address uses os_sync_wait_on_address (a
++ * cross-process futex on shared mappings). A wait on several addresses sleeps on a wake
++ * generation kept in the reserved shm slot 0, which every wake bumps while such waiters
++ * exist ([0] = generation, [1] = number of multi-address waiters). Callers re-check object
++ * state after any wake, so a wake that was meant for someone else only costs a loop. */
++static int *mac_wake_slot;
++#define MAC_WAKE_SLOT mac_wake_slot
++
++static int mac_wait_on_address( int *addr, int val, const struct timespec64 *end, clockid_t clock_id )
++{
++    int ret;
++
++    if (end)
++    {
++        struct timespec now;
++        long long ns;
++
++        clock_gettime( clock_id, &now );
++        ns = (end->tv_sec - now.tv_sec) * 1000000000LL + (end->tv_nsec - now.tv_nsec);
++        if (ns <= 0)
++        {
++            errno = ETIMEDOUT;
++            return -1;
++        }
++        ret = os_sync_wait_on_address_with_timeout( addr, (uint32_t)val, sizeof(*addr),
++                                                    OS_SYNC_WAIT_ON_ADDRESS_SHARED,
++                                                    OS_CLOCK_MACH_ABSOLUTE_TIME, ns );
++    }
++    else ret = os_sync_wait_on_address( addr, (uint32_t)val, sizeof(*addr), OS_SYNC_WAIT_ON_ADDRESS_SHARED );
++
++    return ret < 0 ? -1 : 0;
++}
++
++static int mac_first_changed( const struct futex_waitv *futexes, int count )
++{
++    int i;
++
++    for (i = 0; i < count; i++)
++        if (__atomic_load_n( (int *)u64_to_ptr(futexes[i].uaddr), __ATOMIC_SEQ_CST ) != (int)futexes[i].val)
++            return i;
++    return -1;
++}
++
++/* Same contract as futex_waitv: -1/EAGAIN if a value already differs, -1/ETIMEDOUT on
++ * timeout, otherwise the index of a changed futex (or -1/EAGAIN after a stray wake). */
++static inline int futex_wait_multiple( const struct futex_waitv *futexes,
++        int count, const struct timespec64 *end, clockid_t clock_id )
++{
++    int ret, gen;
++
++    if (count == 1)
++    {
++        if (mac_first_changed( futexes, 1 ) == 0) goto again;
++        ret = mac_wait_on_address( u64_to_ptr(futexes[0].uaddr), futexes[0].val, end, clock_id );
++    }
++    else
++    {
++        __atomic_add_fetch( &mac_wake_slot[1], 1, __ATOMIC_SEQ_CST );
++        gen = __atomic_load_n( &mac_wake_slot[0], __ATOMIC_SEQ_CST );
++        if (mac_first_changed( futexes, count ) >= 0)
++        {
++            __atomic_sub_fetch( &mac_wake_slot[1], 1, __ATOMIC_SEQ_CST );
++            goto again;
++        }
++        ret = mac_wait_on_address( &mac_wake_slot[0], gen, end, clock_id );
++        __atomic_sub_fetch( &mac_wake_slot[1], 1, __ATOMIC_SEQ_CST );
++    }
++    if (ret < 0 && errno == ETIMEDOUT) return -1;
++    if ((ret = mac_first_changed( futexes, count )) >= 0) return ret;
++again:
++    errno = EAGAIN;
++    return -1;
++}
++
++#else
++
+ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+         int count, const struct timespec64 *end, clockid_t clock_id )
+ {
+-#ifdef __linux__
+    if (end)
+         return syscall( __NR_futex_waitv, futexes, count, 0, end, clock_id );
+    else
+         return syscall( __NR_futex_waitv, futexes, count, 0, NULL, 0 );
+-#else
+-   errno = ENOSYS;
+-   return -1;
+-#endif
+ }
+ 
++#endif
++
+ static inline int futex_wake( int *addr, int val )
+ {
+-#ifdef __linux__
+-    return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
++#ifdef __APPLE__
++    os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++    /* Multi-object waiters sleep on the wake generation instead (see futex_wait_multiple). */
++    __atomic_thread_fence( __ATOMIC_SEQ_CST );
++    if (MAC_WAKE_SLOT && __atomic_load_n( &MAC_WAKE_SLOT[1], __ATOMIC_SEQ_CST ))
++    {
++        __atomic_add_fetch( &MAC_WAKE_SLOT[0], 1, __ATOMIC_SEQ_CST );
++        os_sync_wake_by_address_all( &MAC_WAKE_SLOT[0], sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++    }
++    return 0;
+ #else
+-    errno = ENOSYS;
+-    return -1;
++    return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
+ #endif
+ }
+ 
+@@ -466,10 +552,10 @@ void fsync_init( DWORD pid )
+ 
+ 
+     fsync_enabled = 1;
+-#ifdef __linux__
+-    syscall( __NR_futex_waitv, NULL, 0, 0, NULL, 0 );
++#ifdef __APPLE__
++    errno = 0;
+ #else
+-    errno = ENOSYS;
++    syscall( __NR_futex_waitv, NULL, 0, 0, NULL, 0 );
+ #endif
+     if (errno == ENOSYS || errno == EPERM)
+     {
+@@ -497,6 +583,9 @@ void fsync_init( DWORD pid )
+ 
+     current_pid = pid;
+     assert( current_pid );
++#ifdef __APPLE__
++    mac_wake_slot = get_shm( 0 );
++#endif
+ }
+ 
+ NTSTATUS fsync_release_semaphore( HANDLE handle, ULONG count, ULONG *prev )
+diff --git a/server/fsync.c b/server/fsync.c
+index 362c406..158dcef 100644
+--- a/server/fsync.c
++++ b/server/fsync.c
+@@ -35,6 +35,9 @@
+ # include <sys/syscall.h>
+ #endif
+ #include <unistd.h>
++#ifdef __APPLE__
++# include <os/os_sync_wait_on_address.h>
++#endif
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -59,6 +62,11 @@ int fsync_check_support(void)
+ #ifdef __linux__
+     syscall( __NR_futex_waitv, 0, 0, 0, 0, 0 );
+     return getenv( "WINEFSYNC" ) && atoi(getenv( "WINEFSYNC" )) && errno != ENOSYS && errno != EPERM;
++#elif defined(__APPLE__)
++    /* os_sync_wait_on_address backend; WINEMSYNC is accepted too, since it is what macOS
++     * Wine users already set. */
++    return (getenv( "WINEFSYNC" ) && atoi(getenv( "WINEFSYNC" ))) ||
++           (getenv( "WINEMSYNC" ) && atoi(getenv( "WINEMSYNC" )));
+ #else
+     return 0;
+ #endif
+@@ -72,6 +80,13 @@ static int shm_addrs_size;  /* length of the allocated shm_addrs array */
+ 
+ static int is_fsync_initialized;
+ 
++#ifdef __APPLE__
++/* XNU only allows ftruncate() once on a POSIX shm object, so size it up front; pages
++ * are only backed once touched. Same limit as msync. */
++#define FSYNC_MAC_SHM_SIZE (0x100000 * 16)
++static int *mac_wake_slot;
++#endif
++
+ static uint64_t *shm_idx_free_map;
+ static uint32_t shm_idx_free_map_size; /* uint64_t word count */
+ static uint32_t shm_idx_free_search_start_hint;
+@@ -107,7 +122,11 @@ void fsync_init(void)
+     shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
+     shm_addrs_size = 128;
+ 
++#ifdef __APPLE__
++    shm_size = FSYNC_MAC_SHM_SIZE;
++#else
+     shm_size = FSYNC_SHM_PAGE_SIZE;
++#endif
+     if (ftruncate( shm_fd, shm_size ) == -1)
+         perror( "ftruncate" );
+ 
+@@ -185,7 +204,7 @@ static int alloc_shm_idx_from_word( unsigned int word_index )
+ 
+ unsigned int fsync_alloc_shm( int low, int high )
+ {
+-#ifdef __linux__
++#if defined(__linux__) || defined(__APPLE__)
+     unsigned int i;
+     int shm_idx;
+     int *shm;
+@@ -221,6 +240,10 @@ unsigned int fsync_alloc_shm( int low, int high )
+ 
+     while (shm_idx * 16 >= shm_size)
+     {
++#ifdef __APPLE__
++        fprintf( stderr, "fsync: shm index %d exceeds the fixed size of %s.\n", shm_idx, shm_name );
++        return 0;
++#endif
+         /* Better expand the shm section. */
+         shm_size += FSYNC_SHM_PAGE_SIZE;
+         if (ftruncate( shm_fd, shm_size ) == -1)
+@@ -310,11 +333,19 @@ int fsync_grab_shm_idx( unsigned int shm_idx )
+ 
+ static inline int futex_wake( int *addr, int val )
+ {
+-#ifdef __linux__
+-    return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
++#ifdef __APPLE__
++    if (!mac_wake_slot) mac_wake_slot = get_shm( 0 );
++    os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++    /* Multi-object waiters in ntdll sleep on the wake generation in shm slot 0. */
++    __atomic_thread_fence( __ATOMIC_SEQ_CST );
++    if (__atomic_load_n( &mac_wake_slot[1], __ATOMIC_SEQ_CST ))
++    {
++        __atomic_add_fetch( &mac_wake_slot[0], 1, __ATOMIC_SEQ_CST );
++        os_sync_wake_by_address_all( &mac_wake_slot[0], sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++    }
++    return 0;
+ #else
+-    errno = ENOSYS;
+-    return -1;
++    return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
+ #endif
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 9bceafd84c12453643b9ab5576702fbf50023031 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:51:07 -0400
+Subject: [PATCH 14/19] ntdll, server: Skip macOS wake syscalls when nobody
+ sleeps on the address.
+
+A shared os_sync wake costs several microseconds under Rosetta even without
+waiters, which made SetEvent ~12x slower than msync. Track sleepers and
+multi-object watchers in 1024 address buckets in reserved shm, so wakers only
+enter the kernel when the matching bucket is non-zero and only wake the
+multi-object waiters that watch a colliding address.
+---
+ dlls/ntdll/unix/fsync.c | 68 ++++++++++++++++++++++++++---------------
+ server/fsync.c          | 40 +++++++++++++++++++-----
+ 2 files changed, 77 insertions(+), 31 deletions(-)
+
+diff --git a/dlls/ntdll/unix/fsync.c b/dlls/ntdll/unix/fsync.c
+index eb45e0c..0758b87 100644
+--- a/dlls/ntdll/unix/fsync.c
++++ b/dlls/ntdll/unix/fsync.c
+@@ -145,12 +145,23 @@ static void simulate_sched_quantum(void)
+ #ifdef __APPLE__
+ 
+ /* macOS has no futex_waitv. A wait on one address uses os_sync_wait_on_address (a
+- * cross-process futex on shared mappings). A wait on several addresses sleeps on a wake
+- * generation kept in the reserved shm slot 0, which every wake bumps while such waiters
+- * exist ([0] = generation, [1] = number of multi-address waiters). Callers re-check object
+- * state after any wake, so a wake that was meant for someone else only costs a loop. */
+-static int *mac_wake_slot;
+-#define MAC_WAKE_SLOT mac_wake_slot
++ * cross-process futex on shared mappings). A wait on several addresses sleeps on a shared
++ * wake generation that wakers bump when someone watches their address. Callers re-check
++ * object state after any wake, so a wake meant for someone else only costs a loop. */
++/* Shared wait bookkeeping at the start of the fsync shm (indices below
++ * FSYNC_MAC_RESERVED_IDX are never handed out by the server):
++ *   base[0]                    wake generation for multi-address waiters
++ *   base[4 .. 4+1024)          sleepers on a single address, bucketed by address
++ *   base[4+1024 .. 4+2048)     multi-address waiters watching an address, same buckets
++ * Buckets use the offset within a 4 KiB page, which is the same in every process mapping
++ * the shm. Wakers only enter the kernel when the matching bucket is non-zero; collisions
++ * merely cost a redundant wake. */
++#define MAC_SYNC_BUCKETS 1024
++#define MAC_BUCKET(addr) ((((uintptr_t)(addr)) & 0xfff) >> 2)
++static int *mac_sync_base;
++#define MAC_GEN              (&mac_sync_base[0])
++#define MAC_SLEEPERS(addr)   (&mac_sync_base[4 + MAC_BUCKET(addr)])
++#define MAC_WATCHERS(addr)   (&mac_sync_base[4 + MAC_SYNC_BUCKETS + MAC_BUCKET(addr)])
+ 
+ static int mac_wait_on_address( int *addr, int val, const struct timespec64 *end, clockid_t clock_id )
+ {
+@@ -187,6 +198,14 @@ static int mac_first_changed( const struct futex_waitv *futexes, int count )
+     return -1;
+ }
+ 
++static void mac_watch( const struct futex_waitv *futexes, int count, int delta )
++{
++    int i;
++
++    for (i = 0; i < count; i++)
++        __atomic_add_fetch( MAC_WATCHERS(u64_to_ptr(futexes[i].uaddr)), delta, __ATOMIC_SEQ_CST );
++}
++
+ /* Same contract as futex_waitv: -1/EAGAIN if a value already differs, -1/ETIMEDOUT on
+  * timeout, otherwise the index of a changed futex (or -1/EAGAIN after a stray wake). */
+ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+@@ -196,24 +215,23 @@ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+ 
+     if (count == 1)
+     {
+-        if (mac_first_changed( futexes, 1 ) == 0) goto again;
+-        ret = mac_wait_on_address( u64_to_ptr(futexes[0].uaddr), futexes[0].val, end, clock_id );
++        int *addr = u64_to_ptr(futexes[0].uaddr);
++
++        __atomic_add_fetch( MAC_SLEEPERS(addr), 1, __ATOMIC_SEQ_CST );
++        if (mac_first_changed( futexes, 1 ) == 0) ret = 0;
++        else ret = mac_wait_on_address( addr, futexes[0].val, end, clock_id );
++        __atomic_sub_fetch( MAC_SLEEPERS(addr), 1, __ATOMIC_SEQ_CST );
+     }
+     else
+     {
+-        __atomic_add_fetch( &mac_wake_slot[1], 1, __ATOMIC_SEQ_CST );
+-        gen = __atomic_load_n( &mac_wake_slot[0], __ATOMIC_SEQ_CST );
+-        if (mac_first_changed( futexes, count ) >= 0)
+-        {
+-            __atomic_sub_fetch( &mac_wake_slot[1], 1, __ATOMIC_SEQ_CST );
+-            goto again;
+-        }
+-        ret = mac_wait_on_address( &mac_wake_slot[0], gen, end, clock_id );
+-        __atomic_sub_fetch( &mac_wake_slot[1], 1, __ATOMIC_SEQ_CST );
++        mac_watch( futexes, count, 1 );
++        gen = __atomic_load_n( MAC_GEN, __ATOMIC_SEQ_CST );
++        if (mac_first_changed( futexes, count ) >= 0) ret = 0;
++        else ret = mac_wait_on_address( MAC_GEN, gen, end, clock_id );
++        mac_watch( futexes, count, -1 );
+     }
+     if (ret < 0 && errno == ETIMEDOUT) return -1;
+     if ((ret = mac_first_changed( futexes, count )) >= 0) return ret;
+-again:
+     errno = EAGAIN;
+     return -1;
+ }
+@@ -234,13 +252,15 @@ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+ static inline int futex_wake( int *addr, int val )
+ {
+ #ifdef __APPLE__
+-    os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+-    /* Multi-object waiters sleep on the wake generation instead (see futex_wait_multiple). */
++    /* Pairs with the counter increments in the waiters: either they see our store, or we
++     * see their counter. */
+     __atomic_thread_fence( __ATOMIC_SEQ_CST );
+-    if (MAC_WAKE_SLOT && __atomic_load_n( &MAC_WAKE_SLOT[1], __ATOMIC_SEQ_CST ))
++    if (__atomic_load_n( MAC_SLEEPERS(addr), __ATOMIC_SEQ_CST ))
++        os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++    if (__atomic_load_n( MAC_WATCHERS(addr), __ATOMIC_SEQ_CST ))
+     {
+-        __atomic_add_fetch( &MAC_WAKE_SLOT[0], 1, __ATOMIC_SEQ_CST );
+-        os_sync_wake_by_address_all( &MAC_WAKE_SLOT[0], sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++        __atomic_add_fetch( MAC_GEN, 1, __ATOMIC_SEQ_CST );
++        os_sync_wake_by_address_all( MAC_GEN, sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+     }
+     return 0;
+ #else
+@@ -584,7 +604,7 @@ void fsync_init( DWORD pid )
+     current_pid = pid;
+     assert( current_pid );
+ #ifdef __APPLE__
+-    mac_wake_slot = get_shm( 0 );
++    mac_sync_base = get_shm( 0 );
+ #endif
+ }
+ 
+diff --git a/server/fsync.c b/server/fsync.c
+index 158dcef..bbd7f94 100644
+--- a/server/fsync.c
++++ b/server/fsync.c
+@@ -84,7 +84,22 @@ static int is_fsync_initialized;
+ /* XNU only allows ftruncate() once on a POSIX shm object, so size it up front; pages
+  * are only backed once touched. Same limit as msync. */
+ #define FSYNC_MAC_SHM_SIZE (0x100000 * 16)
+-static int *mac_wake_slot;
++/* Shared wait bookkeeping at the start of the fsync shm (indices below
++ * FSYNC_MAC_RESERVED_IDX are never handed out by the server):
++ *   base[0]                    wake generation for multi-address waiters
++ *   base[4 .. 4+1024)          sleepers on a single address, bucketed by address
++ *   base[4+1024 .. 4+2048)     multi-address waiters watching an address, same buckets
++ * Buckets use the offset within a 4 KiB page, which is the same in every process mapping
++ * the shm. Wakers only enter the kernel when the matching bucket is non-zero; collisions
++ * merely cost a redundant wake. */
++#define MAC_SYNC_BUCKETS 1024
++#define MAC_BUCKET(addr) ((((uintptr_t)(addr)) & 0xfff) >> 2)
++static int *mac_sync_base;
++/* first shm index not used by the table above */
++#define FSYNC_MAC_RESERVED_IDX (1 + 2 * MAC_SYNC_BUCKETS * sizeof(int) / 16)
++#define MAC_GEN              (&mac_sync_base[0])
++#define MAC_SLEEPERS(addr)   (&mac_sync_base[4 + MAC_BUCKET(addr)])
++#define MAC_WATCHERS(addr)   (&mac_sync_base[4 + MAC_SYNC_BUCKETS + MAC_BUCKET(addr)])
+ #endif
+ 
+ static uint64_t *shm_idx_free_map;
+@@ -138,6 +153,15 @@ void fsync_init(void)
+     shm_idx_free_map = malloc( shm_idx_free_map_size * sizeof(*shm_idx_free_map) );
+     memset( shm_idx_free_map, 0xff, shm_idx_free_map_size * sizeof(*shm_idx_free_map) );
+     shm_idx_free_map[0] &= ~(uint64_t)1; /* Avoid allocating shm_index 0. */
++#ifdef __APPLE__
++    {
++        unsigned int i;
++
++        for (i = 0; i < FSYNC_MAC_RESERVED_IDX; i++)
++            shm_idx_free_map[i / BITS_IN_FREE_MAP_WORD] &= ~((uint64_t)1 << (i % BITS_IN_FREE_MAP_WORD));
++        shm_idx_free_search_start_hint = FSYNC_MAC_RESERVED_IDX / BITS_IN_FREE_MAP_WORD;
++    }
++#endif
+ 
+     atexit( shm_cleanup );
+ }
+@@ -334,14 +358,16 @@ int fsync_grab_shm_idx( unsigned int shm_idx )
+ static inline int futex_wake( int *addr, int val )
+ {
+ #ifdef __APPLE__
+-    if (!mac_wake_slot) mac_wake_slot = get_shm( 0 );
+-    os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+-    /* Multi-object waiters in ntdll sleep on the wake generation in shm slot 0. */
++    if (!mac_sync_base) mac_sync_base = get_shm( 0 );
++    /* Pairs with the counter increments in the waiters: either they see our store, or we
++     * see their counter. */
+     __atomic_thread_fence( __ATOMIC_SEQ_CST );
+-    if (__atomic_load_n( &mac_wake_slot[1], __ATOMIC_SEQ_CST ))
++    if (__atomic_load_n( MAC_SLEEPERS(addr), __ATOMIC_SEQ_CST ))
++        os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++    if (__atomic_load_n( MAC_WATCHERS(addr), __ATOMIC_SEQ_CST ))
+     {
+-        __atomic_add_fetch( &mac_wake_slot[0], 1, __ATOMIC_SEQ_CST );
+-        os_sync_wake_by_address_all( &mac_wake_slot[0], sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++        __atomic_add_fetch( MAC_GEN, 1, __ATOMIC_SEQ_CST );
++        os_sync_wake_by_address_all( MAC_GEN, sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+     }
+     return 0;
+ #else
+-- 
+2.54.0 (Apple Git-157)
+
+
+From acb795f3870aa6ddc56af3d35c0abc5ca6f7d895 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 14:00:33 -0400
+Subject: [PATCH 15/19] ntdll, server: Give macOS multi-object waits private
+ wake words.
+
+All multi-address waiters shared one wake generation, so every wake of a watched
+object woke every alertable or multi-object waiter in the prefix (Wine services
+included). Each such wait now takes a wake word from a slot bitmap in reserved
+shm and registers it in the bucket lists of its addresses; wakers wake only the
+registered words. A full bucket list falls back to the shared generation.
+The shared bookkeeping moves to include/wine/fsync_mac.h.
+---
+ dlls/ntdll/unix/fsync.c  |  83 +++++++++++----------
+ include/wine/fsync_mac.h | 152 +++++++++++++++++++++++++++++++++++++++
+ server/fsync.c           |  35 ++-------
+ 3 files changed, 199 insertions(+), 71 deletions(-)
+ create mode 100644 include/wine/fsync_mac.h
+
+diff --git a/dlls/ntdll/unix/fsync.c b/dlls/ntdll/unix/fsync.c
+index 0758b87..be1f261 100644
+--- a/dlls/ntdll/unix/fsync.c
++++ b/dlls/ntdll/unix/fsync.c
+@@ -47,6 +47,7 @@
+ #ifdef __APPLE__
+ # include <os/clock.h>
+ # include <os/os_sync_wait_on_address.h>
++# include "wine/fsync_mac.h"
+ #endif
+ 
+ #include "ntstatus.h"
+@@ -144,24 +145,8 @@ static void simulate_sched_quantum(void)
+ 
+ #ifdef __APPLE__
+ 
+-/* macOS has no futex_waitv. A wait on one address uses os_sync_wait_on_address (a
+- * cross-process futex on shared mappings). A wait on several addresses sleeps on a shared
+- * wake generation that wakers bump when someone watches their address. Callers re-check
+- * object state after any wake, so a wake meant for someone else only costs a loop. */
+-/* Shared wait bookkeeping at the start of the fsync shm (indices below
+- * FSYNC_MAC_RESERVED_IDX are never handed out by the server):
+- *   base[0]                    wake generation for multi-address waiters
+- *   base[4 .. 4+1024)          sleepers on a single address, bucketed by address
+- *   base[4+1024 .. 4+2048)     multi-address waiters watching an address, same buckets
+- * Buckets use the offset within a 4 KiB page, which is the same in every process mapping
+- * the shm. Wakers only enter the kernel when the matching bucket is non-zero; collisions
+- * merely cost a redundant wake. */
+-#define MAC_SYNC_BUCKETS 1024
+-#define MAC_BUCKET(addr) ((((uintptr_t)(addr)) & 0xfff) >> 2)
+-static int *mac_sync_base;
+-#define MAC_GEN              (&mac_sync_base[0])
+-#define MAC_SLEEPERS(addr)   (&mac_sync_base[4 + MAC_BUCKET(addr)])
+-#define MAC_WATCHERS(addr)   (&mac_sync_base[4 + MAC_SYNC_BUCKETS + MAC_BUCKET(addr)])
++/* See wine/fsync_mac.h for the wait bookkeeping shared with the server. */
++static struct mac_sync_shm *mac_sync;
+ 
+ static int mac_wait_on_address( int *addr, int val, const struct timespec64 *end, clockid_t clock_id )
+ {
+@@ -198,12 +183,9 @@ static int mac_first_changed( const struct futex_waitv *futexes, int count )
+     return -1;
+ }
+ 
+-static void mac_watch( const struct futex_waitv *futexes, int count, int delta )
++static inline unsigned int futex_bucket( const struct futex_waitv *futex )
+ {
+-    int i;
+-
+-    for (i = 0; i < count; i++)
+-        __atomic_add_fetch( MAC_WATCHERS(u64_to_ptr(futexes[i].uaddr)), delta, __ATOMIC_SEQ_CST );
++    return mac_sync_bucket( u64_to_ptr(futex->uaddr) );
+ }
+ 
+ /* Same contract as futex_waitv: -1/EAGAIN if a value already differs, -1/ETIMEDOUT on
+@@ -211,24 +193,50 @@ static void mac_watch( const struct futex_waitv *futexes, int count, int delta )
+ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+         int count, const struct timespec64 *end, clockid_t clock_id )
+ {
+-    int ret, gen;
++    int ret, i, slot = -1, added = 0;
+ 
+     if (count == 1)
+     {
+         int *addr = u64_to_ptr(futexes[0].uaddr);
++        int *sleepers = &mac_sync->sleepers[mac_sync_bucket( addr )];
+ 
+-        __atomic_add_fetch( MAC_SLEEPERS(addr), 1, __ATOMIC_SEQ_CST );
++        __atomic_add_fetch( sleepers, 1, __ATOMIC_SEQ_CST );
+         if (mac_first_changed( futexes, 1 ) == 0) ret = 0;
+         else ret = mac_wait_on_address( addr, futexes[0].val, end, clock_id );
+-        __atomic_sub_fetch( MAC_SLEEPERS(addr), 1, __ATOMIC_SEQ_CST );
++        __atomic_sub_fetch( sleepers, 1, __ATOMIC_SEQ_CST );
+     }
+     else
+     {
+-        mac_watch( futexes, count, 1 );
+-        gen = __atomic_load_n( MAC_GEN, __ATOMIC_SEQ_CST );
+-        if (mac_first_changed( futexes, count ) >= 0) ret = 0;
+-        else ret = mac_wait_on_address( MAC_GEN, gen, end, clock_id );
+-        mac_watch( futexes, count, -1 );
++        /* Sleep on a private wake word that wakers of any watched address set. */
++        if ((slot = mac_sync_alloc_slot( mac_sync, GetCurrentThreadId() )) >= 0)
++        {
++            __atomic_store_n( &mac_sync->words[slot], 0, __ATOMIC_SEQ_CST );
++            for (added = 0; added < count; added++)
++                if (!mac_sync_list_add( mac_sync, futex_bucket( &futexes[added] ), slot + 1 )) break;
++        }
++        if (slot >= 0 && added == count)
++        {
++            if (mac_first_changed( futexes, count ) >= 0) ret = 0;
++            else ret = mac_wait_on_address( &mac_sync->words[slot], 0, end, clock_id );
++        }
++        else
++        {
++            /* No free slot or a full bucket list: use the shared wake generation. */
++            int gen;
++
++            for (i = 0; i < count; i++)
++                __atomic_add_fetch( &mac_sync->overflow[futex_bucket( &futexes[i] )], 1, __ATOMIC_SEQ_CST );
++            gen = __atomic_load_n( &mac_sync->gen, __ATOMIC_SEQ_CST );
++            if (mac_first_changed( futexes, count ) >= 0) ret = 0;
++            else ret = mac_wait_on_address( &mac_sync->gen, gen, end, clock_id );
++            for (i = 0; i < count; i++)
++                __atomic_sub_fetch( &mac_sync->overflow[futex_bucket( &futexes[i] )], 1, __ATOMIC_SEQ_CST );
++        }
++        if (slot >= 0)
++        {
++            for (i = 0; i < added; i++) mac_sync_list_remove( mac_sync, futex_bucket( &futexes[i] ), slot + 1 );
++            mac_sync_free_slot( mac_sync, slot );
++        }
+     }
+     if (ret < 0 && errno == ETIMEDOUT) return -1;
+     if ((ret = mac_first_changed( futexes, count )) >= 0) return ret;
+@@ -252,16 +260,7 @@ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+ static inline int futex_wake( int *addr, int val )
+ {
+ #ifdef __APPLE__
+-    /* Pairs with the counter increments in the waiters: either they see our store, or we
+-     * see their counter. */
+-    __atomic_thread_fence( __ATOMIC_SEQ_CST );
+-    if (__atomic_load_n( MAC_SLEEPERS(addr), __ATOMIC_SEQ_CST ))
+-        os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+-    if (__atomic_load_n( MAC_WATCHERS(addr), __ATOMIC_SEQ_CST ))
+-    {
+-        __atomic_add_fetch( MAC_GEN, 1, __ATOMIC_SEQ_CST );
+-        os_sync_wake_by_address_all( MAC_GEN, sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+-    }
++    mac_sync_wake( mac_sync, addr );
+     return 0;
+ #else
+     return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
+@@ -604,7 +603,7 @@ void fsync_init( DWORD pid )
+     current_pid = pid;
+     assert( current_pid );
+ #ifdef __APPLE__
+-    mac_sync_base = get_shm( 0 );
++    mac_sync = get_shm( 0 );
+ #endif
+ }
+ 
+diff --git a/include/wine/fsync_mac.h b/include/wine/fsync_mac.h
+new file mode 100644
+index 0000000..dc3a45c
+--- /dev/null
++++ b/include/wine/fsync_mac.h
+@@ -0,0 +1,152 @@
++/*
++ * macOS wait/wake layer for the fsync in-process sync backend
++ *
++ * Copyright 2026 Nectarine contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_FSYNC_MAC_H
++#define __WINE_FSYNC_MAC_H
++
++#ifdef __APPLE__
++
++#include <stdint.h>
++#include <os/os_sync_wait_on_address.h>
++
++/* macOS has os_sync_wait_on_address (a futex that works across processes on shared
++ * mappings, 14.4+) but nothing like futex_waitv. Both the clients and the server keep
++ * this bookkeeping at the start of the fsync shm, which the server never hands out:
++ *
++ *   gen                 wake generation, fallback for multi-address waits
++ *   sleepers[b]         threads sleeping directly on an address in bucket b
++ *   overflow[b]         fallback multi-address waiters watching bucket b
++ *   slot_map            allocation bitmap for per-wait wake words
++ *   words[s]            wake word of multi-address wait s (0 = sleeping, 1 = woken)
++ *   lists[b][k]         s + 1 for multi-address waits watching bucket b, 0 = empty
++ *
++ * Buckets are keyed by the offset within a 4 KiB page, which is the same in every process
++ * that maps the shm (even with Rosetta's 4 KiB pages). Wakers only enter the kernel for
++ * buckets that have someone in them; collisions just cost a redundant wake, and every
++ * waiter re-checks its objects after waking.
++ *
++ * Ordering: a waker stores the new value, then (full fence) reads the bucket; a waiter
++ * registers in the bucket with a full-barrier atomic, then reads the value (or lets the
++ * kernel compare it). So either the waiter sees the new value or the waker sees it. */
++
++#define MAC_SYNC_BUCKETS    1024
++#define MAC_SYNC_LIST_LEN   8
++#define MAC_SYNC_SLOTS      4096
++
++struct mac_sync_shm
++{
++    int      gen;
++    int      pad[3];
++    int      sleepers[MAC_SYNC_BUCKETS];
++    int      overflow[MAC_SYNC_BUCKETS];
++    uint64_t slot_map[MAC_SYNC_SLOTS / 64];
++    int      words[MAC_SYNC_SLOTS];
++    int      lists[MAC_SYNC_BUCKETS][MAC_SYNC_LIST_LEN];
++};
++
++/* first fsync shm index (16 bytes each) not covered by struct mac_sync_shm */
++#define MAC_SYNC_RESERVED_IDX ((sizeof(struct mac_sync_shm) + 15) / 16)
++
++static inline unsigned int mac_sync_bucket( const void *addr )
++{
++    return (((uintptr_t)addr) & 0xfff) >> 2;
++}
++
++static inline void mac_sync_wake_addr( int *addr )
++{
++    os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++}
++
++/* Wake everything waiting for *addr to change. Call after storing the new value. */
++static inline void mac_sync_wake( struct mac_sync_shm *shm, int *addr )
++{
++    unsigned int b = mac_sync_bucket( addr ), k;
++
++    __atomic_thread_fence( __ATOMIC_SEQ_CST );
++    if (__atomic_load_n( &shm->sleepers[b], __ATOMIC_SEQ_CST )) mac_sync_wake_addr( addr );
++    for (k = 0; k < MAC_SYNC_LIST_LEN; k++)
++    {
++        int entry = __atomic_load_n( &shm->lists[b][k], __ATOMIC_SEQ_CST );
++        if (!entry) continue;
++        __atomic_store_n( &shm->words[entry - 1], 1, __ATOMIC_SEQ_CST );
++        mac_sync_wake_addr( &shm->words[entry - 1] );
++    }
++    if (__atomic_load_n( &shm->overflow[b], __ATOMIC_SEQ_CST ))
++    {
++        __atomic_add_fetch( &shm->gen, 1, __ATOMIC_SEQ_CST );
++        mac_sync_wake_addr( &shm->gen );
++    }
++}
++
++static inline int mac_sync_alloc_slot( struct mac_sync_shm *shm, unsigned int hint )
++{
++    unsigned int i, w;
++
++    for (i = 0; i < MAC_SYNC_SLOTS / 64; i++)
++    {
++        uint64_t *word = &shm->slot_map[w = (hint + i) % (MAC_SYNC_SLOTS / 64)];
++        uint64_t cur = __atomic_load_n( word, __ATOMIC_SEQ_CST );
++
++        while (~cur)
++        {
++            unsigned int bit = __builtin_ctzll( ~cur );
++            if (__atomic_compare_exchange_n( word, &cur, cur | ((uint64_t)1 << bit), 0,
++                                             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
++                return w * 64 + bit;
++        }
++    }
++    return -1;
++}
++
++static inline void mac_sync_free_slot( struct mac_sync_shm *shm, int slot )
++{
++    __atomic_and_fetch( &shm->slot_map[slot / 64], ~((uint64_t)1 << (slot % 64)), __ATOMIC_SEQ_CST );
++}
++
++static inline int mac_sync_list_add( struct mac_sync_shm *shm, unsigned int b, int entry )
++{
++    unsigned int k;
++
++    for (k = 0; k < MAC_SYNC_LIST_LEN; k++)
++    {
++        int empty = 0;
++        if (__atomic_compare_exchange_n( &shm->lists[b][k], &empty, entry, 0,
++                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
++            return 1;
++    }
++    return 0;
++}
++
++static inline void mac_sync_list_remove( struct mac_sync_shm *shm, unsigned int b, int entry )
++{
++    unsigned int k;
++
++    for (k = 0; k < MAC_SYNC_LIST_LEN; k++)
++    {
++        int expected = entry;
++        if (__atomic_compare_exchange_n( &shm->lists[b][k], &expected, 0, 0,
++                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
++            return;
++    }
++}
++
++#endif /* __APPLE__ */
++
++#endif /* __WINE_FSYNC_MAC_H */
+diff --git a/server/fsync.c b/server/fsync.c
+index bbd7f94..39e07e2 100644
+--- a/server/fsync.c
++++ b/server/fsync.c
+@@ -37,6 +37,7 @@
+ #include <unistd.h>
+ #ifdef __APPLE__
+ # include <os/os_sync_wait_on_address.h>
++# include "wine/fsync_mac.h"
+ #endif
+ 
+ #include "ntstatus.h"
+@@ -84,22 +85,7 @@ static int is_fsync_initialized;
+ /* XNU only allows ftruncate() once on a POSIX shm object, so size it up front; pages
+  * are only backed once touched. Same limit as msync. */
+ #define FSYNC_MAC_SHM_SIZE (0x100000 * 16)
+-/* Shared wait bookkeeping at the start of the fsync shm (indices below
+- * FSYNC_MAC_RESERVED_IDX are never handed out by the server):
+- *   base[0]                    wake generation for multi-address waiters
+- *   base[4 .. 4+1024)          sleepers on a single address, bucketed by address
+- *   base[4+1024 .. 4+2048)     multi-address waiters watching an address, same buckets
+- * Buckets use the offset within a 4 KiB page, which is the same in every process mapping
+- * the shm. Wakers only enter the kernel when the matching bucket is non-zero; collisions
+- * merely cost a redundant wake. */
+-#define MAC_SYNC_BUCKETS 1024
+-#define MAC_BUCKET(addr) ((((uintptr_t)(addr)) & 0xfff) >> 2)
+-static int *mac_sync_base;
+-/* first shm index not used by the table above */
+-#define FSYNC_MAC_RESERVED_IDX (1 + 2 * MAC_SYNC_BUCKETS * sizeof(int) / 16)
+-#define MAC_GEN              (&mac_sync_base[0])
+-#define MAC_SLEEPERS(addr)   (&mac_sync_base[4 + MAC_BUCKET(addr)])
+-#define MAC_WATCHERS(addr)   (&mac_sync_base[4 + MAC_SYNC_BUCKETS + MAC_BUCKET(addr)])
++static struct mac_sync_shm *mac_sync;
+ #endif
+ 
+ static uint64_t *shm_idx_free_map;
+@@ -157,9 +143,9 @@ void fsync_init(void)
+     {
+         unsigned int i;
+ 
+-        for (i = 0; i < FSYNC_MAC_RESERVED_IDX; i++)
++        for (i = 0; i < MAC_SYNC_RESERVED_IDX; i++)
+             shm_idx_free_map[i / BITS_IN_FREE_MAP_WORD] &= ~((uint64_t)1 << (i % BITS_IN_FREE_MAP_WORD));
+-        shm_idx_free_search_start_hint = FSYNC_MAC_RESERVED_IDX / BITS_IN_FREE_MAP_WORD;
++        shm_idx_free_search_start_hint = MAC_SYNC_RESERVED_IDX / BITS_IN_FREE_MAP_WORD;
+     }
+ #endif
+ 
+@@ -358,17 +344,8 @@ int fsync_grab_shm_idx( unsigned int shm_idx )
+ static inline int futex_wake( int *addr, int val )
+ {
+ #ifdef __APPLE__
+-    if (!mac_sync_base) mac_sync_base = get_shm( 0 );
+-    /* Pairs with the counter increments in the waiters: either they see our store, or we
+-     * see their counter. */
+-    __atomic_thread_fence( __ATOMIC_SEQ_CST );
+-    if (__atomic_load_n( MAC_SLEEPERS(addr), __ATOMIC_SEQ_CST ))
+-        os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+-    if (__atomic_load_n( MAC_WATCHERS(addr), __ATOMIC_SEQ_CST ))
+-    {
+-        __atomic_add_fetch( MAC_GEN, 1, __ATOMIC_SEQ_CST );
+-        os_sync_wake_by_address_all( MAC_GEN, sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+-    }
++    if (!mac_sync) mac_sync = get_shm( 0 );
++    mac_sync_wake( mac_sync, addr );
+     return 0;
+ #else
+     return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
+-- 
+2.54.0 (Apple Git-157)
+
+
+From d98f804c8e5d5dea24e2cdb269d860da8b4a7fee Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 14:23:57 -0400
+Subject: [PATCH 16/19] win32u: Default the Vulkan fullscreen hack off on
+ macOS.
+
+winemac.drv already sizes client views in raw monitor pixels and scales
+natively, so the extra compute scaling pass only costs GPU time: DOOM 64
+(D3D11 via DXVK) fell from 60 to ~23 fps with it and held 60 without.
+Also only force shaderStorageImageWriteWithoutFormat when the hack is on.
+---
+ dlls/win32u/vulkan.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 911db79..a115dc1 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -916,6 +916,7 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device,
+     device->queues = (void *)(device + 1);
+     device->queue_props = (void *)(device->queues + queue_count);
+ 
++if (fshack_enabled)
+ {
+         VkPhysicalDeviceFeatures2 *features2;
+ 
+@@ -4098,7 +4099,14 @@ static void vulkan_init_once(void)
+     VkResult res;
+ 
+     const char *env = getenv( "WINE_DISABLE_FULLSCREEN_HACK" );
++#ifdef __APPLE__
++    /* winemac.drv already presents at the raw monitor size and scales natively; the extra
++     * compute blit cost DOOM 64 more than half its frame rate on an M1 Pro. Opt in with
++     * WINE_DISABLE_FULLSCREEN_HACK=0. */
++    fshack_enabled = env && !atoi( env );
++#else
+     fshack_enabled = !env || !atoi( env );
++#endif
+ 
+ #ifdef SONAME_LIBVULKAN
+     vulkan_handle = dlopen( SONAME_LIBVULKAN, RTLD_NOW );
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 209207628b64cda9a64ecf5df62b8ff4e8c12c9e Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 14:47:46 -0400
+Subject: [PATCH 17/19] win32u: Enable host Vulkan portability enumeration.
+
+From Gcenx macports-wine (0001-win32u-Enable-host-Vulkan-portability-enumeration.diff):
+lets the Vulkan loader expose MoltenVK, a portability driver, to Wine.
+---
+ dlls/win32u/vulkan.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index a115dc1..2b496fd 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -503,6 +503,11 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
+         instance->obj.extensions.has_VK_EXT_surface_maintenance1 = 1;
+     if (vulkan_funcs.host_extensions.has_VK_KHR_get_physical_device_properties2)
+         instance->obj.extensions.has_VK_KHR_get_physical_device_properties2 = 1;
++    if (vulkan_funcs.host_extensions.has_VK_KHR_portability_enumeration)
++    {
++        instance->obj.extensions.has_VK_KHR_portability_enumeration = 1;
++        info->flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
++    }
+     if (use_external_memory())
+         instance->obj.extensions.has_VK_KHR_external_memory_capabilities = 1;
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 2cdaa583adb59d8c684220546ad5a3f252e5cf27 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 15:05:51 -0400
+Subject: [PATCH 18/19] ntdll: Only use lsteamclient redirections when
+ lsteamclient.dll is installed.
+
+Otherwise the real Windows steamclient(64).dll gets its tier0/vstdlib imports
+redirected to ntdll and fails to initialise, which breaks the Windows Steam
+client running inside the prefix (the macOS case).
+---
+ dlls/ntdll/loader.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index 113310a..bfb11ab 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -1158,6 +1158,18 @@ static int use_lsteamclient(void)
+     use = !get_env( L"PROTON_DISABLE_LSTEAMCLIENT", env, sizeof(env) ) || *env == '0';
+     if (!use)
+         ERR("lsteamclient disabled.\n");
++    else
++    {
++        /* Without the lsteamclient bridge (e.g. on macOS, where the real Windows Steam
++         * client runs in the prefix), redirecting the tier0/vstdlib imports of steamclient
++         * to ntdll breaks the client ("InternalAPI_Init_Internal failed"). */
++        WCHAR path[MAX_PATH];
++
++        wcscpy( path, system_dir );
++        wcscat( path, L"lsteamclient.dll" );
++        if (!(use = RtlDoesFileExists_U( path )))
++            TRACE( "lsteamclient.dll not installed, leaving steamclient alone.\n" );
++    }
+     return use;
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 8d7274d3443b7898a8c58df687a0f3ed90337d6e Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 15:40:56 -0400
+Subject: [PATCH 19/19] ntdll: Add syscall wrappers to work around clang ABI
+ breakage (from upstream f43402cde33).
+
+Clang assumes callers zero-extend narrow integer arguments, which the PE side
+(built with GCC) does not, so BOOLEAN syscall arguments can arrive with dirty
+upper bits on a clang-built Unix side (any macOS build). Upstream fixed this in
+wine-11.1 after moving the table to syscall.c; this places the same wrappers
+around Proton's table in loader.c and undefines the redirects afterwards.
+---
+ dlls/ntdll/unix/loader.c | 211 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 211 insertions(+)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 1b7482b..9e401e3 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -93,6 +93,7 @@
+ #include "winioctl.h"
+ #include "winternl.h"
+ #include "unix_private.h"
++#include "wine/asm.h"
+ #include "wine/list.h"
+ #include "ntsyscalls.h"
+ #include "wine/debug.h"
+@@ -141,6 +142,172 @@ static void stub_syscall( const char *name )
+ #define SYSCALL_STUB(name) static void name(void) { stub_syscall( #name ); }
+ ALL_SYSCALL_STUBS
+ 
++/* Clang on x86-64, and on macOS ARM64, assumes that function parameters are extended by the caller,
++ * contrary to the ABI standards */
++#if (defined(__x86_64__) && defined(__clang__)) || (defined(__aarch64__) && defined(__APPLE__))
++
++#ifdef __x86_64__
++
++#define WRAP_FUNC(name,code) \
++    extern NTSTATUS wrap_##name(void); \
++    __ASM_GLOBAL_FUNC( wrap_##name, code "jmp " __ASM_NAME(#name) )
++#define ARG1 "movzbl %dil,%edi\n\t"
++#define ARG2 "movzbl %sil,%esi\n\t"
++#define ARG3 "movzbl %dl,%edx\n\t"
++#define ARG4 "movzbl %cl,%ecx\n\t"
++#define ARG5 "movzbl %r8b,%r8d\n\t"
++#define ARG6 "movzbl %r9b,%r9d\n\t"
++#define ARG7 ARGn(7)
++#define ARG8 ARGn(8)
++#define ARGn(n) "andq $0xff,(" #n "-6)*8(%rsp)\n\t"
++
++WRAP_FUNC( NtAccessCheckByTypeAndAuditAlarm, ARGn(13) )
++WRAP_FUNC( NtLockFile, ARGn(9) ARGn(10) )
++WRAP_FUNC( NtNotifyChangeDirectoryFile, ARGn(9) )
++WRAP_FUNC( NtNotifyChangeKey, ARG7 ARGn(10) )
++WRAP_FUNC( NtNotifyChangeMultipleKeys, ARGn(9) ARGn(12) )
++WRAP_FUNC( NtQueryDirectoryFile, ARGn(9) ARGn(11) )
++WRAP_FUNC( NtQueryEaFile, ARG5 ARGn(9) )
++
++#define NtAccessCheckByTypeAndAuditAlarm wrap_NtAccessCheckByTypeAndAuditAlarm
++#define NtLockFile wrap_NtLockFile
++#define NtNotifyChangeDirectoryFile wrap_NtNotifyChangeDirectoryFile
++#define NtNotifyChangeKey wrap_NtNotifyChangeKey
++#define NtNotifyChangeMultipleKeys wrap_NtNotifyChangeMultipleKeys
++#define NtQueryDirectoryFile wrap_NtQueryDirectoryFile
++#define NtQueryEaFile wrap_NtQueryEaFile
++
++#else
++
++#define WRAP_FUNC(name,code) \
++    extern NTSTATUS wrap_##name(void); \
++    __ASM_GLOBAL_FUNC( wrap_##name, code "b " __ASM_NAME(#name) )
++#define ARG1 "and w0, w0, #0xff\n\t"
++#define ARG2 "and w1, w1, #0xff\n\t"
++#define ARG3 "and w2, w2, #0xff\n\t"
++#define ARG4 "and w3, w3, #0xff\n\t"
++#define ARG5 "and w4, w4, #0xff\n\t"
++#define ARG6 "and w5, w5, #0xff\n\t"
++#define ARG7 "and w6, w6, #0xff\n\t"
++#define ARG8 "and w7, w7, #0xff\n\t"
++
++/* Additionally, macOS doesn't follow the standard ABI for stack packing:
++ * types smaller that 64-bit are packed on the stack. The first 8 args are
++ * in registers, so it only affects a few functions.
++ */
++
++WRAP_FUNC( NtCreateNamedPipeFile, /* ULONG, ULONG, ULONG, ULONG, ULONG, LARGE_INTEGER* */
++           "ldr w8, [sp, #0x08]\n\t"
++           "ldp x9, x10, [sp, #0x10]\n\t"
++           "ldp x11, x12, [sp, #0x20]\n\t"
++           "str w8, [sp, #0x04]\n\t"
++           "stp w9, w10, [sp, #0x8]\n\t"
++           "stp x11, x12, [sp, #0x10]\n\t" )
++WRAP_FUNC( NtLockFile, /* BOOLEAN, BOOLEAN */
++           "ldrb w8, [sp, #8]\n\t"
++           "strb w8, [sp, #1]\n\t" )
++WRAP_FUNC( NtMapViewOfSection, /* ULONG, ULONG */
++           "ldr w8, [sp, #8]\n\t"
++           "str w8, [sp, #4]\n\t" )
++WRAP_FUNC( NtNotifyChangeKey, /* ULONG, BOOLEAN */
++           ARG7
++           "ldrb w8, [sp, #8]\n\t"
++           "strb w8, [sp, #4]\n\t" )
++WRAP_FUNC( NtNotifyChangeMultipleKeys, /* BOOLEAN, void*, ULONG, BOOLEAN */
++           "ldrb w8, [sp, #0x18]\n\t"
++           "strb w8, [sp, #0x14]\n\t" )
++WRAP_FUNC( NtQueryEaFile, ARG5 )
++
++#define NtCreateNamedPipeFile wrap_NtCreateNamedPipeFile
++#define NtLockFile wrap_NtLockFile
++#define NtMapViewOfSection wrap_NtMapViewOfSection
++#define NtNotifyChangeKey wrap_NtNotifyChangeKey
++#define NtNotifyChangeMultipleKeys wrap_NtNotifyChangeMultipleKeys
++#define NtQueryEaFile wrap_NtQueryEaFile
++
++#endif
++
++WRAP_FUNC( NtAcceptConnectPort, ARG4 )
++WRAP_FUNC( NtAccessCheckAndAuditAlarm, ARG8 )
++WRAP_FUNC( NtAdjustGroupsToken, ARG2 )
++WRAP_FUNC( NtAdjustPrivilegesToken, ARG2 )
++WRAP_FUNC( NtCloseObjectAuditAlarm, ARG3 )
++WRAP_FUNC( NtCommitTransaction, ARG2 )
++WRAP_FUNC( NtContinue, ARG2 )
++WRAP_FUNC( NtCreateEvent, ARG5 )
++WRAP_FUNC( NtCreateMutant, ARG4 )
++/* WRAP_FUNC( NtCreateProcess, ARG5 ) */
++WRAP_FUNC( NtCreateThread, ARG8 )
++WRAP_FUNC( NtDelayExecution, ARG1 )
++WRAP_FUNC( NtDuplicateToken, ARG4 )
++WRAP_FUNC( NtInitiatePowerAction, ARG4 )
++WRAP_FUNC( NtOpenThreadToken, ARG3 )
++WRAP_FUNC( NtOpenThreadTokenEx, ARG3 )
++/* WRAP_FUNC( NtPrivilegeObjectAuditAlarm, ARG6 ) */
++/* WRAP_FUNC( NtPrivilegedServiceAuditAlarm, ARG5 ) */
++WRAP_FUNC( NtQueryDefaultLocale, ARG1 )
++WRAP_FUNC( NtQueryDirectoryObject, ARG4 ARG5 )
++WRAP_FUNC( NtReleaseKeyedEvent, ARG3 )
++WRAP_FUNC( NtRemoveIoCompletionEx, ARG6 )
++WRAP_FUNC( NtRollbackTransaction, ARG2 )
++WRAP_FUNC( NtSetDebugFilterState, ARG3 )
++WRAP_FUNC( NtSetDefaultLocale, ARG1 )
++WRAP_FUNC( NtSetTimer, ARG5 )
++WRAP_FUNC( NtSetTimerResolution, ARG2 )
++WRAP_FUNC( NtSignalAndWaitForSingleObject, ARG3 )
++WRAP_FUNC( NtWaitForDebugEvent, ARG2 )
++WRAP_FUNC( NtWaitForKeyedEvent, ARG3 )
++WRAP_FUNC( NtWaitForMultipleObjects, ARG4 )
++WRAP_FUNC( NtWaitForSingleObject, ARG2 )
++
++#define NtAcceptConnectPort wrap_NtAcceptConnectPort
++#define NtAccessCheckAndAuditAlarm wrap_NtAccessCheckAndAuditAlarm
++#define NtAdjustGroupsToken wrap_NtAdjustGroupsToken
++#define NtAdjustPrivilegesToken wrap_NtAdjustPrivilegesToken
++#define NtCloseObjectAuditAlarm wrap_NtCloseObjectAuditAlarm
++#define NtCommitTransaction wrap_NtCommitTransaction
++#define NtContinue wrap_NtContinue
++#define NtCreateEvent wrap_NtCreateEvent
++#define NtCreateMutant wrap_NtCreateMutant
++#define NtCreateProcess wrap_NtCreateProcess
++#define NtCreateThread wrap_NtCreateThread
++#define NtDelayExecution wrap_NtDelayExecution
++#define NtDuplicateToken wrap_NtDuplicateToken
++#define NtInitiatePowerAction wrap_NtInitiatePowerAction
++#define NtOpenThreadToken wrap_NtOpenThreadToken
++#define NtOpenThreadTokenEx wrap_NtOpenThreadTokenEx
++#define NtPrivilegeObjectAuditAlarm wrap_NtPrivilegeObjectAuditAlarm
++#define NtPrivilegedServiceAuditAlarm wrap_NtPrivilegedServiceAuditAlarm
++#define NtQueryDefaultLocale wrap_NtQueryDefaultLocale
++#define NtQueryDirectoryObject wrap_NtQueryDirectoryObject
++#define NtReleaseKeyedEvent wrap_NtReleaseKeyedEvent
++#define NtRemoveIoCompletionEx wrap_NtRemoveIoCompletionEx
++#define NtRollbackTransaction wrap_NtRollbackTransaction
++#define NtSetDebugFilterState wrap_NtSetDebugFilterState
++#define NtSetDefaultLocale wrap_NtSetDefaultLocale
++#define NtSetTimer wrap_NtSetTimer
++#define NtSetTimerResolution wrap_NtSetTimerResolution
++#define NtSignalAndWaitForSingleObject wrap_NtSignalAndWaitForSingleObject
++#define NtWaitForDebugEvent wrap_NtWaitForDebugEvent
++#define NtWaitForKeyedEvent wrap_NtWaitForKeyedEvent
++#define NtWaitForMultipleObjects wrap_NtWaitForMultipleObjects
++#define NtWaitForSingleObject wrap_NtWaitForSingleObject
++
++#undef ARG1
++#undef ARG2
++#undef ARG3
++#undef ARG4
++#undef ARG5
++#undef ARG6
++#undef ARG7
++#undef ARG8
++#undef ARGn
++#undef WRAP_FUNC
++
++#endif  /* (__x86_64__ && __clang__) || (__aarch64__ && __APPLE__) */
++
++
++
+ static void * const syscalls[] =
+ {
+ #define SYSCALL_ENTRY(id,name,args) name,
+@@ -148,6 +315,50 @@ static void * const syscalls[] =
+ #undef SYSCALL_ENTRY
+ };
+ 
++#if (defined(__x86_64__) && defined(__clang__)) || (defined(__aarch64__) && defined(__APPLE__))
++#undef NtAcceptConnectPort
++#undef NtAccessCheckAndAuditAlarm
++#undef NtAccessCheckByTypeAndAuditAlarm
++#undef NtAdjustGroupsToken
++#undef NtAdjustPrivilegesToken
++#undef NtCloseObjectAuditAlarm
++#undef NtCommitTransaction
++#undef NtContinue
++#undef NtCreateEvent
++#undef NtCreateMutant
++#undef NtCreateNamedPipeFile
++#undef NtCreateProcess
++#undef NtCreateThread
++#undef NtDelayExecution
++#undef NtDuplicateToken
++#undef NtInitiatePowerAction
++#undef NtLockFile
++#undef NtMapViewOfSection
++#undef NtNotifyChangeDirectoryFile
++#undef NtNotifyChangeKey
++#undef NtNotifyChangeMultipleKeys
++#undef NtOpenThreadToken
++#undef NtOpenThreadTokenEx
++#undef NtPrivilegeObjectAuditAlarm
++#undef NtPrivilegedServiceAuditAlarm
++#undef NtQueryDefaultLocale
++#undef NtQueryDirectoryFile
++#undef NtQueryDirectoryObject
++#undef NtQueryEaFile
++#undef NtReleaseKeyedEvent
++#undef NtRemoveIoCompletionEx
++#undef NtRollbackTransaction
++#undef NtSetDebugFilterState
++#undef NtSetDefaultLocale
++#undef NtSetTimer
++#undef NtSetTimerResolution
++#undef NtSignalAndWaitForSingleObject
++#undef NtWaitForDebugEvent
++#undef NtWaitForKeyedEvent
++#undef NtWaitForMultipleObjects
++#undef NtWaitForSingleObject
++#endif
++
+ static BYTE syscall_args[ARRAY_SIZE(syscalls)] =
+ {
+ #define SYSCALL_ENTRY(id,name,args) args,
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,201 @@
+From 5b3366f35f893cff6c450acef88fa684d35c1829 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:51:07 -0400
+Subject: [PATCH 13/29] ntdll, server: Skip macOS wake syscalls when nobody
+ sleeps on the address.
+
+A shared os_sync wake costs several microseconds under Rosetta even without
+waiters, which made SetEvent ~12x slower than msync. Track sleepers and
+multi-object watchers in 1024 address buckets in reserved shm, so wakers only
+enter the kernel when the matching bucket is non-zero and only wake the
+multi-object waiters that watch a colliding address.
+---
+ dlls/ntdll/unix/fsync.c | 68 ++++++++++++++++++++++++++---------------
+ server/fsync.c          | 40 +++++++++++++++++++-----
+ 2 files changed, 77 insertions(+), 31 deletions(-)
+
+diff --git a/dlls/ntdll/unix/fsync.c b/dlls/ntdll/unix/fsync.c
+index eb45e0cf31a..0758b87e31c 100644
+--- a/dlls/ntdll/unix/fsync.c
++++ b/dlls/ntdll/unix/fsync.c
+@@ -145,12 +145,23 @@ static void simulate_sched_quantum(void)
+ #ifdef __APPLE__
+ 
+ /* macOS has no futex_waitv. A wait on one address uses os_sync_wait_on_address (a
+- * cross-process futex on shared mappings). A wait on several addresses sleeps on a wake
+- * generation kept in the reserved shm slot 0, which every wake bumps while such waiters
+- * exist ([0] = generation, [1] = number of multi-address waiters). Callers re-check object
+- * state after any wake, so a wake that was meant for someone else only costs a loop. */
+-static int *mac_wake_slot;
+-#define MAC_WAKE_SLOT mac_wake_slot
++ * cross-process futex on shared mappings). A wait on several addresses sleeps on a shared
++ * wake generation that wakers bump when someone watches their address. Callers re-check
++ * object state after any wake, so a wake meant for someone else only costs a loop. */
++/* Shared wait bookkeeping at the start of the fsync shm (indices below
++ * FSYNC_MAC_RESERVED_IDX are never handed out by the server):
++ *   base[0]                    wake generation for multi-address waiters
++ *   base[4 .. 4+1024)          sleepers on a single address, bucketed by address
++ *   base[4+1024 .. 4+2048)     multi-address waiters watching an address, same buckets
++ * Buckets use the offset within a 4 KiB page, which is the same in every process mapping
++ * the shm. Wakers only enter the kernel when the matching bucket is non-zero; collisions
++ * merely cost a redundant wake. */
++#define MAC_SYNC_BUCKETS 1024
++#define MAC_BUCKET(addr) ((((uintptr_t)(addr)) & 0xfff) >> 2)
++static int *mac_sync_base;
++#define MAC_GEN              (&mac_sync_base[0])
++#define MAC_SLEEPERS(addr)   (&mac_sync_base[4 + MAC_BUCKET(addr)])
++#define MAC_WATCHERS(addr)   (&mac_sync_base[4 + MAC_SYNC_BUCKETS + MAC_BUCKET(addr)])
+ 
+ static int mac_wait_on_address( int *addr, int val, const struct timespec64 *end, clockid_t clock_id )
+ {
+@@ -187,6 +198,14 @@ static int mac_first_changed( const struct futex_waitv *futexes, int count )
+     return -1;
+ }
+ 
++static void mac_watch( const struct futex_waitv *futexes, int count, int delta )
++{
++    int i;
++
++    for (i = 0; i < count; i++)
++        __atomic_add_fetch( MAC_WATCHERS(u64_to_ptr(futexes[i].uaddr)), delta, __ATOMIC_SEQ_CST );
++}
++
+ /* Same contract as futex_waitv: -1/EAGAIN if a value already differs, -1/ETIMEDOUT on
+  * timeout, otherwise the index of a changed futex (or -1/EAGAIN after a stray wake). */
+ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+@@ -196,24 +215,23 @@ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+ 
+     if (count == 1)
+     {
+-        if (mac_first_changed( futexes, 1 ) == 0) goto again;
+-        ret = mac_wait_on_address( u64_to_ptr(futexes[0].uaddr), futexes[0].val, end, clock_id );
++        int *addr = u64_to_ptr(futexes[0].uaddr);
++
++        __atomic_add_fetch( MAC_SLEEPERS(addr), 1, __ATOMIC_SEQ_CST );
++        if (mac_first_changed( futexes, 1 ) == 0) ret = 0;
++        else ret = mac_wait_on_address( addr, futexes[0].val, end, clock_id );
++        __atomic_sub_fetch( MAC_SLEEPERS(addr), 1, __ATOMIC_SEQ_CST );
+     }
+     else
+     {
+-        __atomic_add_fetch( &mac_wake_slot[1], 1, __ATOMIC_SEQ_CST );
+-        gen = __atomic_load_n( &mac_wake_slot[0], __ATOMIC_SEQ_CST );
+-        if (mac_first_changed( futexes, count ) >= 0)
+-        {
+-            __atomic_sub_fetch( &mac_wake_slot[1], 1, __ATOMIC_SEQ_CST );
+-            goto again;
+-        }
+-        ret = mac_wait_on_address( &mac_wake_slot[0], gen, end, clock_id );
+-        __atomic_sub_fetch( &mac_wake_slot[1], 1, __ATOMIC_SEQ_CST );
++        mac_watch( futexes, count, 1 );
++        gen = __atomic_load_n( MAC_GEN, __ATOMIC_SEQ_CST );
++        if (mac_first_changed( futexes, count ) >= 0) ret = 0;
++        else ret = mac_wait_on_address( MAC_GEN, gen, end, clock_id );
++        mac_watch( futexes, count, -1 );
+     }
+     if (ret < 0 && errno == ETIMEDOUT) return -1;
+     if ((ret = mac_first_changed( futexes, count )) >= 0) return ret;
+-again:
+     errno = EAGAIN;
+     return -1;
+ }
+@@ -234,13 +252,15 @@ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+ static inline int futex_wake( int *addr, int val )
+ {
+ #ifdef __APPLE__
+-    os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+-    /* Multi-object waiters sleep on the wake generation instead (see futex_wait_multiple). */
++    /* Pairs with the counter increments in the waiters: either they see our store, or we
++     * see their counter. */
+     __atomic_thread_fence( __ATOMIC_SEQ_CST );
+-    if (MAC_WAKE_SLOT && __atomic_load_n( &MAC_WAKE_SLOT[1], __ATOMIC_SEQ_CST ))
++    if (__atomic_load_n( MAC_SLEEPERS(addr), __ATOMIC_SEQ_CST ))
++        os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++    if (__atomic_load_n( MAC_WATCHERS(addr), __ATOMIC_SEQ_CST ))
+     {
+-        __atomic_add_fetch( &MAC_WAKE_SLOT[0], 1, __ATOMIC_SEQ_CST );
+-        os_sync_wake_by_address_all( &MAC_WAKE_SLOT[0], sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++        __atomic_add_fetch( MAC_GEN, 1, __ATOMIC_SEQ_CST );
++        os_sync_wake_by_address_all( MAC_GEN, sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+     }
+     return 0;
+ #else
+@@ -584,7 +604,7 @@ void fsync_init( DWORD pid )
+     current_pid = pid;
+     assert( current_pid );
+ #ifdef __APPLE__
+-    mac_wake_slot = get_shm( 0 );
++    mac_sync_base = get_shm( 0 );
+ #endif
+ }
+ 
+diff --git a/server/fsync.c b/server/fsync.c
+index 158dcef354d..bbd7f943362 100644
+--- a/server/fsync.c
++++ b/server/fsync.c
+@@ -84,7 +84,22 @@ static int is_fsync_initialized;
+ /* XNU only allows ftruncate() once on a POSIX shm object, so size it up front; pages
+  * are only backed once touched. Same limit as msync. */
+ #define FSYNC_MAC_SHM_SIZE (0x100000 * 16)
+-static int *mac_wake_slot;
++/* Shared wait bookkeeping at the start of the fsync shm (indices below
++ * FSYNC_MAC_RESERVED_IDX are never handed out by the server):
++ *   base[0]                    wake generation for multi-address waiters
++ *   base[4 .. 4+1024)          sleepers on a single address, bucketed by address
++ *   base[4+1024 .. 4+2048)     multi-address waiters watching an address, same buckets
++ * Buckets use the offset within a 4 KiB page, which is the same in every process mapping
++ * the shm. Wakers only enter the kernel when the matching bucket is non-zero; collisions
++ * merely cost a redundant wake. */
++#define MAC_SYNC_BUCKETS 1024
++#define MAC_BUCKET(addr) ((((uintptr_t)(addr)) & 0xfff) >> 2)
++static int *mac_sync_base;
++/* first shm index not used by the table above */
++#define FSYNC_MAC_RESERVED_IDX (1 + 2 * MAC_SYNC_BUCKETS * sizeof(int) / 16)
++#define MAC_GEN              (&mac_sync_base[0])
++#define MAC_SLEEPERS(addr)   (&mac_sync_base[4 + MAC_BUCKET(addr)])
++#define MAC_WATCHERS(addr)   (&mac_sync_base[4 + MAC_SYNC_BUCKETS + MAC_BUCKET(addr)])
+ #endif
+ 
+ static uint64_t *shm_idx_free_map;
+@@ -138,6 +153,15 @@ void fsync_init(void)
+     shm_idx_free_map = malloc( shm_idx_free_map_size * sizeof(*shm_idx_free_map) );
+     memset( shm_idx_free_map, 0xff, shm_idx_free_map_size * sizeof(*shm_idx_free_map) );
+     shm_idx_free_map[0] &= ~(uint64_t)1; /* Avoid allocating shm_index 0. */
++#ifdef __APPLE__
++    {
++        unsigned int i;
++
++        for (i = 0; i < FSYNC_MAC_RESERVED_IDX; i++)
++            shm_idx_free_map[i / BITS_IN_FREE_MAP_WORD] &= ~((uint64_t)1 << (i % BITS_IN_FREE_MAP_WORD));
++        shm_idx_free_search_start_hint = FSYNC_MAC_RESERVED_IDX / BITS_IN_FREE_MAP_WORD;
++    }
++#endif
+ 
+     atexit( shm_cleanup );
+ }
+@@ -334,14 +358,16 @@ int fsync_grab_shm_idx( unsigned int shm_idx )
+ static inline int futex_wake( int *addr, int val )
+ {
+ #ifdef __APPLE__
+-    if (!mac_wake_slot) mac_wake_slot = get_shm( 0 );
+-    os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+-    /* Multi-object waiters in ntdll sleep on the wake generation in shm slot 0. */
++    if (!mac_sync_base) mac_sync_base = get_shm( 0 );
++    /* Pairs with the counter increments in the waiters: either they see our store, or we
++     * see their counter. */
+     __atomic_thread_fence( __ATOMIC_SEQ_CST );
+-    if (__atomic_load_n( &mac_wake_slot[1], __ATOMIC_SEQ_CST ))
++    if (__atomic_load_n( MAC_SLEEPERS(addr), __ATOMIC_SEQ_CST ))
++        os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++    if (__atomic_load_n( MAC_WATCHERS(addr), __ATOMIC_SEQ_CST ))
+     {
+-        __atomic_add_fetch( &mac_wake_slot[0], 1, __ATOMIC_SEQ_CST );
+-        os_sync_wake_by_address_all( &mac_wake_slot[0], sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++        __atomic_add_fetch( MAC_GEN, 1, __ATOMIC_SEQ_CST );
++        os_sync_wake_by_address_all( MAC_GEN, sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+     }
+     return 0;
+ #else
+-- 
+2.43.0
+

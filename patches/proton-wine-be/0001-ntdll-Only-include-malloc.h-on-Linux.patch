@@ -1,0 +1,27 @@
+From 35160c5606470319445f9236191a625cb8179c5e Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 12:51:18 -0400
+Subject: [PATCH 01/29] ntdll: Only include malloc.h on Linux.
+
+macOS has no <malloc.h>.
+---
+ dlls/ntdll/unix/loader.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 2cc53c36bf5..552c8b82195 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -38,7 +38,9 @@
+ #include <sys/mman.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
++#ifdef __linux__
+ #include <malloc.h>
++#endif
+ #include <dlfcn.h>
+ #ifdef HAVE_PWD_H
+ # include <pwd.h>
+-- 
+2.43.0
+

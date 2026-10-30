@@ -1,0 +1,86 @@
+From 1d94f90062fec504a34e6db85ab445721d8e6c37 Mon Sep 17 00:00:00 2001
+From: Reedo22 <141674188+Reedo22@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 21:06:25 -0400
+Subject: [PATCH 2/2] ntdll: Treat a backend trial whose owner is gone or stuck
+ exiting as failed.
+
+A GPU-faulted D3DMetal process can stay in exit for a while still holding the
+per-image trial lock, so the next launch reused D3DMetal instead of advancing.
+---
+ dlls/ntdll/unix/loader.c | 46 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 9cdc84b..785d58d 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -139,6 +139,7 @@ SECTION_IMAGE_INFORMATION main_image_info = { NULL };
+ #if defined(__APPLE__) && defined(__x86_64__)
+ /* Selected once in __wine_main(), before any Wine thread enters PE code. */
+ BOOL use_macos_pthread_gsbase;
++static BOOL backend_trial_owner_gone( const char *state );
+ /* Selected backend builtins, searched before the default engine DLL directory. */
+ static char *graphics_dll_dir;
+ #endif
+@@ -3066,7 +3067,19 @@ static BOOL select_fallback_backend( int argc, char *argv[], const char *image )
+         {
+             if (backend_lock != -1) close( backend_lock );
+             backend_lock = -1;
+-            /* Another instance owns the trial. Reuse its choice without changing state. */
++            /* Another instance owns the trial. Reuse its choice without changing state -- unless
++             * that owner is gone or stuck exiting (a GPU-faulted process can sit in exit for
++             * minutes still holding the lock): then the trial failed; take over a fresh lock. */
++            if (backend_trial_owner_gone( path ))
++            {
++                unlink( lock );
++                backend_lock = open( lock, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600 );
++                if (backend_lock != -1 && flock( backend_lock, LOCK_EX | LOCK_NB ))
++                {
++                    close( backend_lock );
++                    backend_lock = -1;
++                }
++            }
+         }
+         if (!forced && (file = fopen( path, "r" )))
+         {
+@@ -3101,6 +3114,37 @@ selected:
+     return TRUE;
+ }
+ 
++#ifdef __APPLE__
++#include <sys/sysctl.h>
++#endif
++/* Is the process recorded in a "trying <backend> pid=N" state file gone or stuck exiting? */
++static BOOL backend_trial_owner_gone( const char *state )
++{
++    char phase[16], backend[16];
++    long pid = 0;
++    FILE *file = fopen( state, "r" );
++    BOOL gone = FALSE;
++
++    if (!file) return FALSE;
++    if (fscanf( file, "%15s %15s pid=%ld", phase, backend, &pid ) == 3 && !strcmp( phase, "trying" ) && pid > 0)
++    {
++        if (kill( pid, 0 ) == -1 && errno == ESRCH) gone = TRUE;
++#ifdef __APPLE__
++        else
++        {
++            int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid };
++            struct kinfo_proc info;
++            size_t size = sizeof(info);
++            if (!sysctl( mib, 4, &info, &size, NULL, 0 ) && size == sizeof(info) &&
++                ((info.kp_proc.p_flag & P_WEXIT) || info.kp_proc.p_stat == SZOMB))
++                gone = TRUE;
++        }
++#endif
++    }
++    fclose( file );
++    return gone;
++}
++
+ /* NECTARINE_D3D12=auto: one engine/prefix for everything. Each process picks its D3D backend
+  * from its own image: D3D12 importers get Apple's D3DMetal (its DLL directory searched first),
+  * everything else keeps the default (DXVK). Decided before anything reads the backend. */
+-- 
+2.54.0 (Apple Git-157)
+

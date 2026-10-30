@@ -1,0 +1,653 @@
+From 01828209f30cb665fd9fd4b4a32c7b90c7c78bc4 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sun, 25 Oct 2026 21:25:39 -0400
+Subject: [PATCH] Nectarine SPIRV-Cross patches (consolidated from mvk-ue25)
+
+---
+ spirv_common.hpp |   9 +
+ spirv_msl.cpp    | 437 +++++++++++++++++++++++++++++++++++++++++++++--
+ spirv_msl.hpp    |  20 +++
+ 3 files changed, 456 insertions(+), 10 deletions(-)
+
+diff --git a/spirv_common.hpp b/spirv_common.hpp
+index b003d4db..3fbf7db6 100644
+--- a/spirv_common.hpp
++++ b/spirv_common.hpp
+@@ -794,6 +794,15 @@ struct SPIRExpression : IVariant
+ 	std::string expression;
+ 	TypeID expression_type = 0;
+ 
++	// Optional MSL predicate guarding an access into a descriptor-backed buffer.
++	// The MSL backend populates this when it can derive the descriptor bound.
++	std::string robust_buffer_access_condition;
++	std::string robust_buffer_byte_offset;
++	std::string robust_buffer_index_condition;
++	uint32_t robust_buffer_matrix_stride = 0;
++	uint32_t robust_buffer_component_stride = 0;
++	bool robust_buffer_row_major = false;
++
+ 	// If this expression is a forwarded load,
+ 	// allow us to reference the original variable.
+ 	ID loaded_from = 0;
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index c5a9d433..dd791dd8 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include "spirv_msl.hpp"
++#include <cstdlib>
+ #include "GLSL.std.450.h"
+ 
+ #include <algorithm>
+@@ -275,7 +276,15 @@ void CompilerMSL::build_implicit_builtins()
+ 	bool need_local_invocation_index =
+ 		(msl_options.emulate_subgroups && active_input_builtins.get(BuiltInSubgroupId)) || is_mesh_shader() ||
+ 		needs_workgroup_zero_init || needs_local_invocation_index;
+-	bool need_workgroup_size = msl_options.emulate_subgroups && active_input_builtins.get(BuiltInNumSubgroups);
++	// MSL has no gl_WorkGroupSize builtin, so SPIRV-Cross must materialise it as a constant.
++	// It only did so for subgroup emulation, yet the MSL it emits can reference the builtin
++	// for other reasons and then fails to compile with "use of undeclared identifier
++	// 'gl_WorkGroupSize'". The case that matters here is the cooperative threadgroup-memory
++	// zero-init loop (VK_KHR_zero_initialize_workgroup_memory, which DXVK 3.x enables and
++	// DXVK 1.10.3 did not): it emits "<var>_stride = gl_WorkGroupSize.x * ..." and is already
++	// covered by need_local_invocation_index just below, so mirror that here.
++	bool need_workgroup_size = (msl_options.emulate_subgroups && active_input_builtins.get(BuiltInNumSubgroups)) ||
++	                           needs_workgroup_zero_init || active_input_builtins.get(BuiltInWorkgroupSize);
+ 	bool force_frag_depth_passthrough =
+ 	    get_execution_model() == ExecutionModelFragment && !uses_explicit_early_fragment_test() && need_subpass_input &&
+ 	    msl_options.enable_frag_depth_builtin && msl_options.input_attachment_is_ds_attachment;
+@@ -1852,6 +1861,7 @@ string CompilerMSL::compile()
+ 		next_metal_resource_index_buffer = 0;
+ 		next_metal_resource_index_texture = 0;
+ 		next_metal_resource_index_sampler = 0;
++		collect_claimed_msl_resource_indices();
+ 		for (auto &id : next_metal_resource_ids)
+ 			id = 0;
+ 
+@@ -4723,6 +4733,99 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
+ 		}
+ 	}
+ 
++	if (!capture_output_to_buffer && storage == StorageClassOutput && get_execution_model() == ExecutionModelVertex)
++	{
++		// Metal requires every input of the fragment stage to be written by the vertex stage, with a
++		// matching type. Vulkan does not: an input with no matching output in the previous stage just
++		// reads undefined values. So when the app has told us what the next stage reads, via
++		// add_msl_shader_output(), declare a dummy output for each location this shader does not write,
++		// so that the two stage interfaces link.
++		for (auto &output : outputs_by_location)
++		{
++			if (output.second.builtin != BuiltInMax)
++				continue;
++			if (location_outputs_in_use.count(output.first.location) != 0)
++				continue;
++
++			// Create a fake variable to put at the location.
++			uint32_t offset = ir.increase_bound_by(4);
++			uint32_t type_id = offset;
++			uint32_t vec_type_id = offset + 1;
++			uint32_t ptr_type_id = offset + 2;
++			uint32_t var_id = offset + 3;
++
++			SPIRType::BaseType basetype = output.second.basetype;
++			if (basetype == SPIRType::Unknown)
++			{
++				switch (output.second.format)
++				{
++				case MSL_SHADER_VARIABLE_FORMAT_UINT8:
++					basetype = SPIRType::UByte;
++					break;
++				case MSL_SHADER_VARIABLE_FORMAT_UINT16:
++					basetype = SPIRType::UShort;
++					break;
++				case MSL_SHADER_VARIABLE_FORMAT_ANY16:
++					basetype = SPIRType::Half;
++					break;
++				default:
++					basetype = SPIRType::Float;
++					break;
++				}
++			}
++
++			bool is_float = basetype == SPIRType::Half || basetype == SPIRType::Float || basetype == SPIRType::Double;
++			SPIRType type { is_float ? OpTypeFloat : OpTypeInt };
++			type.basetype = basetype;
++			switch (basetype)
++			{
++			case SPIRType::SByte:
++			case SPIRType::UByte:
++				type.width = 8;
++				break;
++			case SPIRType::Short:
++			case SPIRType::UShort:
++			case SPIRType::Half:
++				type.width = 16;
++				break;
++			case SPIRType::Int64:
++			case SPIRType::UInt64:
++			case SPIRType::Double:
++				type.width = 64;
++				break;
++			default:
++				type.width = 32;
++				break;
++			}
++			set<SPIRType>(type_id, type);
++
++			if (output.second.vecsize > 1)
++			{
++				type.op = OpTypeVector;
++				type.vecsize = output.second.vecsize;
++				set<SPIRType>(vec_type_id, type);
++				type_id = vec_type_id;
++			}
++
++			type.op = OpTypePointer;
++			type.pointer = true;
++			type.pointer_depth++;
++			type.parent_type = type_id;
++			type.storage = storage;
++			auto &ptr_type = set<SPIRType>(ptr_type_id, type);
++			ptr_type.self = type_id;
++
++			auto &fake_var = set<SPIRVariable>(var_id, ptr_type_id, storage);
++			set_decoration(var_id, DecorationLocation, output.first.location);
++			if (output.first.component)
++				set_decoration(var_id, DecorationComponent, output.first.component);
++
++			meta.strip_array = false;
++			meta.allow_local_declaration = false;
++			add_variable_to_interface_block(storage, ib_var_ref, ib_type, fake_var, meta);
++		}
++	}
++
+ 	// When multiple variables need to access same location,
+ 	// unroll locations one by one and we will flatten output or input as necessary.
+ 	for (auto &loc : meta.location_meta)
+@@ -4913,6 +5016,63 @@ uint32_t CompilerMSL::ensure_correct_builtin_type(uint32_t type_id, BuiltIn buil
+ // Ensure that the type is compatible with the shader input.
+ // If it is, simply return the given type ID.
+ // Otherwise, create a new type, and return its ID.
++// Record every Metal resource index the app explicitly assigned for this entry point, so that
++// resources the app did not bind can be allocated indices that do not collide with them.
++void CompilerMSL::collect_claimed_msl_resource_indices()
++{
++	claimed_msl_buffer_indices.clear();
++	claimed_msl_texture_indices.clear();
++	claimed_msl_sampler_indices.clear();
++
++	auto model = get_entry_point().model;
++	for (auto &binding : resource_bindings)
++	{
++		if (binding.first.model != model)
++			continue;
++		auto &rb = binding.second.first;
++		switch (rb.basetype)
++		{
++		case SPIRType::Image:
++		case SPIRType::SampledImage:
++			claimed_msl_texture_indices.insert(rb.msl_texture);
++			if (rb.basetype == SPIRType::SampledImage)
++				claimed_msl_sampler_indices.insert(rb.msl_sampler);
++			break;
++		case SPIRType::Sampler:
++			claimed_msl_sampler_indices.insert(rb.msl_sampler);
++			break;
++		default:
++			claimed_msl_buffer_indices.insert(rb.msl_buffer);
++			break;
++		}
++	}
++}
++
++// Return the next index of a resource type that the app has not explicitly claimed, and advance the
++// counter past it. An app is not obliged to describe every resource a shader declares - a pipeline
++// layout may omit a descriptor set, or not list the stage - and without this, such a resource would
++// be handed an index another resource already occupies, which Metal refuses to compile.
++uint32_t CompilerMSL::allocate_unclaimed_msl_resource_index(uint32_t &next_index, uint32_t stride,
++                                                            const std::unordered_set<uint32_t> &claimed)
++{
++	if (!claimed.empty())
++	{
++		for (;;)
++		{
++			bool collides = false;
++			for (uint32_t i = 0; i < stride && !collides; i++)
++				collides = claimed.count(next_index + i) != 0;
++			if (!collides)
++				break;
++			next_index++;
++		}
++	}
++
++	uint32_t index = next_index;
++	next_index += stride;
++	return index;
++}
++
+ uint32_t CompilerMSL::ensure_correct_input_type(uint32_t type_id, uint32_t location, uint32_t component, uint32_t num_components, bool strip_array)
+ {
+ 	auto &type = get<SPIRType>(type_id);
+@@ -9449,6 +9609,136 @@ bool CompilerMSL::check_physical_type_cast(std::string &expr, const SPIRType *ty
+ 	return false;
+ }
+ 
++// Size in the SPIR-V storage layout, rather than sizeof(the thread-local value).
++uint64_t CompilerMSL::robust_buffer_access_size(uint32_t type_id, const SPIRType &type, uint32_t matrix_stride,
++                                               bool row_major, uint32_t component_stride) const
++{
++	if (!type.array.empty())
++	{
++		uint32_t count = type.array_size_literal.back() ? type.array.back() : evaluate_constant_u32(type.array.back());
++		return uint64_t(get_decoration(type_id, DecorationArrayStride)) * count;
++	}
++	if (type.basetype == SPIRType::Struct)
++		return get_declared_struct_size(type);
++	uint64_t scalar_size = type.width / 8;
++	if (type.columns > 1)
++	{
++		uint64_t major_count = row_major ? type.vecsize : type.columns;
++		uint64_t minor_count = row_major ? type.columns : type.vecsize;
++		return (major_count - 1) * matrix_stride + minor_count * scalar_size;
++	}
++	return (type.vecsize - 1) * (component_stride ? component_stride : scalar_size) + scalar_size;
++}
++
++// Loads in loops may reuse a hoisted temporary. Reset it for every execution,
++// including the out-of-range iteration after an earlier in-range iteration.
++void CompilerMSL::emit_robust_buffer_zero(uint32_t type_id, const string &expression, uint32_t depth)
++{
++	auto &type = get<SPIRType>(type_id);
++	if (!type.array.empty())
++	{
++		auto count = type.array_size_literal.back() ? convert_to_string(type.array.back()) : to_expression(type.array.back());
++		auto index = join("spvRobustZeroIndex", depth);
++		statement("for (uint ", index, " = 0; ", index, " < ", count, "; ++", index, ")");
++		begin_scope();
++		emit_robust_buffer_zero(type.parent_type, join(expression, "[", index, "]"), depth + 1);
++		end_scope();
++	}
++	else
++		statement(expression, " = {};");
++}
++
++void CompilerMSL::emit_robust_buffer_access_chain(const uint32_t *ops, uint32_t length)
++{
++	auto *var = maybe_get_backing_variable(ops[2]);
++	auto *result = maybe_get<SPIRExpression>(ops[1]);
++	if (!var || !result || (var->storage != StorageClassStorageBuffer &&
++	    !(var->storage == StorageClassUniform && has_decoration(get_variable_data_type(*var).self, DecorationBufferBlock))))
++		return;
++	// Descriptor arrays have a separate descriptor index and require their selected
++	// size expression, not the containing variable's size. Keep the existing path.
++	if (!get_variable_data_type(*var).array.empty())
++		return;
++	auto *base = maybe_get<SPIRExpression>(ops[2]);
++	string offset = base && !base->robust_buffer_byte_offset.empty() ? base->robust_buffer_byte_offset : "0ul";
++	string indices = base ? base->robust_buffer_index_condition : string();
++	uint32_t matrix_stride = base ? base->robust_buffer_matrix_stride : 0;
++	uint32_t component_stride = base ? base->robust_buffer_component_stride : 0;
++	bool row_major = base && base->robust_buffer_row_major;
++	uint32_t type_id = get_pointee_type_id(expression_type_id(ops[2]));
++	const SPIRType *type = &get<SPIRType>(type_id);
++	auto append_condition = [&](const string &condition) {
++		indices = indices.empty() ? condition : join("(", indices, " && ", condition, ")");
++	};
++	auto size = to_buffer_size_expression(var->self);
++	for (uint32_t i = 3; i < length; i++)
++	{
++		uint32_t index_id = ops[i];
++		if (!type->array.empty())
++		{
++			uint32_t stride = get_decoration(type_id, DecorationArrayStride);
++			if (!stride)
++				return;
++			auto index = join("ulong(", to_expression(index_id), ")");
++			// Check before multiplying, so an invalid large/negative index cannot wrap.
++			append_condition(join("(", index, " <= ulong(", size, ") / ", stride, "ul)"));
++			if (type->op != OpTypeRuntimeArray)
++			{
++				auto count = type->array_size_literal.back() ? convert_to_string(type->array.back()) : to_expression(type->array.back());
++				append_condition(join("(", index, " < ulong(", count, "))"));
++			}
++			offset = join("(", offset, " + ", index, " * ", stride, "ul)");
++			type_id = type->parent_type;
++			type = &get<SPIRType>(type_id);
++		}
++		else if (type->basetype == SPIRType::Struct)
++		{
++			auto *member = maybe_get<SPIRConstant>(index_id);
++			if (!member || member->scalar() >= type->member_types.size())
++				return;
++			uint32_t index = member->scalar();
++			offset = join("(", offset, " + ", get_member_decoration(type->self, index, DecorationOffset), "ul)");
++			matrix_stride = get_member_decoration(type->self, index, DecorationMatrixStride);
++			row_major = has_member_decoration(type->self, index, DecorationRowMajor);
++			component_stride = 0;
++			type_id = type->member_types[index];
++			type = &get<SPIRType>(type_id);
++		}
++		else if (type->columns > 1)
++		{
++			auto index = join("ulong(", to_expression(index_id), ")");
++			append_condition(join("(", index, " < ", type->columns, "ul)"));
++			uint32_t stride = row_major ? type->width / 8 : matrix_stride;
++			component_stride = row_major ? matrix_stride : type->width / 8;
++			offset = join("(", offset, " + ", index, " * ", stride, "ul)");
++			type_id = type->parent_type;
++			type = &get<SPIRType>(type_id);
++		}
++		else if (type->vecsize > 1)
++		{
++			auto index = join("ulong(", to_expression(index_id), ")");
++			append_condition(join("(", index, " < ", type->vecsize, "ul)"));
++			offset = join("(", offset, " + ", index, " * ", component_stride ? component_stride : type->width / 8, "ul)");
++			type_id = type->parent_type;
++			type = &get<SPIRType>(type_id);
++			component_stride = 0;
++		}
++		else
++			return;
++	}
++	uint64_t access_size = robust_buffer_access_size(type_id, *type, matrix_stride, row_major, component_stride);
++	if (!access_size)
++		return;
++	result->robust_buffer_byte_offset = offset;
++	result->robust_buffer_index_condition = indices;
++	result->robust_buffer_matrix_stride = matrix_stride;
++	result->robust_buffer_component_stride = component_stride;
++	result->robust_buffer_row_major = row_major;
++	auto range = join("(ulong(", size, ") >= ", access_size, "ul && ", offset,
++	                  " <= ulong(", size, ") - ", access_size, "ul)");
++	result->robust_buffer_access_condition = indices.empty() ? range : join("(", indices, " && ", range, ")");
++}
++
+ // Override for MSL-specific syntax instructions
+ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ {
+@@ -9512,7 +9802,30 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 				// Sample mask input for Metal is not an array
+ 				if (is_sample_mask)
+ 					set_decoration(id, DecorationBuiltIn, BuiltInSampleMask);
+-				CompilerGLSL::emit_instruction(instruction);
++				auto *ptr_expr = maybe_get<SPIRExpression>(ptr);
++				if (ptr_expr && !ptr_expr->robust_buffer_access_condition.empty())
++				{
++					// Keep the common load path's physical-type conversion, packed vectors,
++					// row-major matrices and array copies. Only execute it when in range.
++					auto condition = ptr_expr->robust_buffer_access_condition;
++					bool zero_initialize = options.force_zero_initialized_variables;
++					options.force_zero_initialized_variables = true;
++					emit_uninitialized_temporary_expression(ops[0], id);
++					options.force_zero_initialized_variables = zero_initialize;
++					emit_robust_buffer_zero(ops[0], to_expression(id), 0);
++					bool hoisted = hoisted_temporaries.insert(id).second;
++					bool forced = forced_temporaries.insert(id).second;
++					statement("if (", condition, ")");
++					begin_scope();
++					CompilerGLSL::emit_instruction(instruction);
++					end_scope();
++					if (hoisted)
++						hoisted_temporaries.erase(id);
++					if (forced)
++						forced_temporaries.erase(id);
++				}
++				else
++					CompilerGLSL::emit_instruction(instruction);
+ 			}
+ 		}
+ 		break;
+@@ -10132,6 +10445,68 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 		}
+ 		else
+ 			CompilerGLSL::emit_instruction(instruction);
++		if (opcode != OpPtrAccessChain && msl_options.robust_buffer_access)
++			emit_robust_buffer_access_chain(ops, instruction.length);
++		if (opcode != OpPtrAccessChain && msl_options.robust_buffer_access &&
++		    maybe_get_backing_variable(ops[2]) &&
++		    !get_variable_data_type(*maybe_get_backing_variable(ops[2])).array.empty())
++		{
++			uint32_t ptr_id = ops[2];
++			auto *result_expr = maybe_get<SPIRExpression>(ops[1]);
++			auto *base_expr = maybe_get<SPIRExpression>(ptr_id);
++			if (result_expr && base_expr)
++				result_expr->robust_buffer_access_condition = base_expr->robust_buffer_access_condition;
++			else if (result_expr)
++				result_expr->robust_buffer_access_condition.clear();
++
++			uint32_t type_id = expression_type_id(ptr_id);
++			const SPIRType *type = &get_pointee_type(type_id);
++			type_id = type->self;
++			auto *buffer_var = maybe_get_backing_variable(ptr_id);
++			uint32_t byte_offset = 0;
++			for (uint32_t i = 3; i < instruction.length; i++)
++			{
++				uint32_t index_id = ops[i];
++				if (type->basetype == SPIRType::Struct)
++				{
++					auto *member = maybe_get<SPIRConstant>(index_id);
++					if (!member || member->scalar() >= type->member_types.size())
++						break;
++					uint32_t member_index = member->scalar();
++					byte_offset += get_member_decoration(type->self, member_index, DecorationOffset);
++					type_id = type->member_types[member_index];
++					type = &get<SPIRType>(type_id);
++				}
++				else if (type->op == OpTypeRuntimeArray)
++				{
++					if (buffer_var && result_expr)
++					{
++						uint32_t stride = get_decoration(type_id, DecorationArrayStride);
++						if (stride)
++						{
++							auto size = to_buffer_size_expression(buffer_var->self);
++							auto index = join("uint(", to_expression(index_id), ")");
++							auto available = byte_offset ? join("(", size, " >= ", byte_offset, "u ? (", size, " - ", byte_offset, "u) : 0u)") : size;
++							auto bound = join("(", available, " / ", stride, "u)");
++							auto condition = join("(", index, " < ", bound, ")");
++							if (!result_expr->robust_buffer_access_condition.empty())
++								result_expr->robust_buffer_access_condition = join("(", result_expr->robust_buffer_access_condition, " && ", condition, ")");
++							else
++								result_expr->robust_buffer_access_condition = condition;
++						}
++					}
++					type_id = type->parent_type;
++					type = &get<SPIRType>(type_id);
++				}
++				else if (!type->array.empty())
++				{
++					type_id = type->parent_type;
++					type = &get<SPIRType>(type_id);
++				}
++				else
++					break;
++			}
++		}
+ 		fix_up_interpolant_access_chain(ops, instruction.length);
+ 		break;
+ 
+@@ -10157,8 +10532,17 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ 			statement("if (!", builtin_to_glsl(BuiltInHelperInvocation, StorageClassInput), ")");
+ 			begin_scope();
+ 		}
++		auto *ptr_expr = maybe_get<SPIRExpression>(ops[0]);
++		bool robust_store = ptr_expr && !ptr_expr->robust_buffer_access_condition.empty();
++		if (robust_store)
++		{
++			statement("if (", ptr_expr->robust_buffer_access_condition, ")");
++			begin_scope();
++		}
+ 		if (!maybe_emit_array_assignment(ops[0], ops[1]))
+ 			CompilerGLSL::emit_instruction(instruction);
++		if (robust_store)
++			end_scope();
+ 		if (needs_frag_discard_checks() &&
+ 		    (type.storage == StorageClassStorageBuffer || type.storage == StorageClassUniform))
+ 			end_scope();
+@@ -11360,6 +11744,8 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 
+ 	auto &ptr_type = expression_type(obj);
+ 	auto &type = get_pointee_type(ptr_type);
++	auto *access_expr = maybe_get<SPIRExpression>(obj);
++	const string &robust_condition = access_expr ? access_expr->robust_buffer_access_condition : string();
+ 	auto expected_type = type.basetype;
+ 	if (opcode == OpAtomicUMax || opcode == OpAtomicUMin)
+ 		expected_type = to_unsigned_basetype(type.width);
+@@ -11418,6 +11804,13 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 		else
+ 			exp = join("(!", builtin_to_glsl(BuiltInHelperInvocation, StorageClassInput), " ? ");
+ 	}
++	if (!robust_condition.empty() && is_atomic_compare_exchange_strong)
++	{
++		emit_uninitialized_temporary_expression(result_type, result_id);
++		statement(to_expression(result_id), " = ", type_to_glsl(get<SPIRType>(result_type)), "(0);");
++		statement("if (", robust_condition, ")");
++		begin_scope();
++	}
+ 
+ 	if (use_native_image_atomic)
+ 	{
+@@ -11549,7 +11942,7 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 		// the CAS loop, otherwise it will loop infinitely, with the comparison test always failing.
+ 		// The function updates the comparator value from the memory value, so the additional
+ 		// comparison test evaluates the memory value against the expected value.
+-		if (!check_discard)
++		if (!check_discard && robust_condition.empty())
+ 		{
+ 			emit_uninitialized_temporary_expression(result_type, result_id);
+ 			if (vec4_temporary_id)
+@@ -11620,14 +12013,28 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 			exp += ")";
+ 		}
+ 
++		if (!robust_condition.empty() && strcmp(op, "atomic_store") != 0)
++			exp = join("(", robust_condition, " ? (", exp, ") : ", type_to_glsl(get<SPIRType>(result_type)), "(0))");
++
+ 		if (expected_type != type.basetype)
+ 			exp = bitcast_expression(type, expected_type, exp);
+ 
+ 		if (strcmp(op, "atomic_store") != 0)
+ 			emit_op(result_type, result_id, exp, false);
+ 		else
++		{
++			if (!robust_condition.empty())
++			{
++				statement("if (", robust_condition, ")");
++				begin_scope();
++			}
+ 			statement(exp, ";");
++			if (!robust_condition.empty())
++				end_scope();
++		}
+ 	}
++	if (!robust_condition.empty() && is_atomic_compare_exchange_strong)
++		end_scope();
+ 
+ 	flush_all_atomic_capable_variables();
+ }
+@@ -11655,7 +12062,12 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop,
+ 
+ 	// Only precise:: preserves NaN in trancendentals (supposedly, cannot find documentation for this).
+ 	const auto drop_nan_inf = FPFastMathModeNotInfMask | FPFastMathModeNotNaNMask;
+-	bool preserve_nan = (get_fp_fast_math_flags_for_op(result_type, id) & drop_nan_inf) != drop_nan_inf;
++	// MVK_X_FAST_TRANSCENDENTALS: HLSL (fxc/dxc default) makes no NaN/Inf-preservation promise
++	// for these ops, so for translated D3D shaders the precise:: overrides only cost the
++	// multi-instruction software sequences Apple GPUs use for them.
++	static const bool mvkx_fast_transcendentals = getenv("MVK_X_FAST_TRANSCENDENTALS") != nullptr;
++	bool preserve_nan = !mvkx_fast_transcendentals &&
++	                    ((get_fp_fast_math_flags_for_op(result_type, id) & drop_nan_inf) != drop_nan_inf);
+ 	const char *preserve_str = preserve_nan ? "precise" : "fast";
+ 
+ 	// TODO: Emit the default behavior to match existing code. Might need to be revisited.
+@@ -16151,16 +16563,16 @@ uint32_t CompilerMSL::get_metal_resource_index(SPIRVariable &var, SPIRType::Base
+ 		switch (basetype)
+ 		{
+ 		case SPIRType::Image:
+-			resource_index = next_metal_resource_index_texture;
+-			next_metal_resource_index_texture += binding_stride;
++			resource_index = allocate_unclaimed_msl_resource_index(next_metal_resource_index_texture, binding_stride,
++			                                                       claimed_msl_texture_indices);
+ 			break;
+ 		case SPIRType::Sampler:
+-			resource_index = next_metal_resource_index_sampler;
+-			next_metal_resource_index_sampler += binding_stride;
++			resource_index = allocate_unclaimed_msl_resource_index(next_metal_resource_index_sampler, binding_stride,
++			                                                       claimed_msl_sampler_indices);
+ 			break;
+ 		default:
+-			resource_index = next_metal_resource_index_buffer;
+-			next_metal_resource_index_buffer += binding_stride;
++			resource_index = allocate_unclaimed_msl_resource_index(next_metal_resource_index_buffer, binding_stride,
++			                                                       claimed_msl_buffer_indices);
+ 			break;
+ 		}
+ 	}
+@@ -19196,6 +19608,11 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
+ 		uint32_t result_type = args[0];
+ 		uint32_t id = args[1];
+ 		uint32_t ptr = args[2];
++		auto *var = self.maybe_get_backing_variable(ptr);
++		if (self.msl_options.robust_buffer_access && var && (var->storage == StorageClassStorageBuffer ||
++		            (var->storage == StorageClassUniform &&
++		             self.has_decoration(self.get_variable_data_type(*var).self, DecorationBufferBlock))))
++			self.buffers_requiring_array_length.insert(var->self);
+ 
+ 		set<SPIRExpression>(id, "", result_type, true);
+ 		self.register_read(id, ptr, true);
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index de8608f6..884bc367 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -82,6 +82,10 @@ struct MSLShaderInterfaceVariable
+ 	BuiltIn builtin = BuiltInMax;
+ 	uint32_t vecsize = 0;
+ 	MSLShaderVariableRate rate = MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
++	// Base type of the variable in the stage that declares it. Only used when a variable has to be
++	// synthesized because this shader does not declare it, where format is too coarse to pick a type
++	// that will link against the neighbouring stage. Unknown falls back to the format.
++	SPIRType::BaseType basetype = SPIRType::Unknown;
+ };
+ 
+ // Matches the binding index of a MSL resource for a binding within a descriptor set.
+@@ -342,6 +346,9 @@ public:
+ 		bool texture_1D_as_2D = false;
+ 		bool emulate_reversed_depth_viewport = false;
+ 
++		// Guard descriptor-backed buffer accesses when Vulkan robustBufferAccess is enabled.
++		bool robust_buffer_access = false;
++
+ 		// Enable use of Metal argument buffers.
+ 		// MSL 2.0 must also be enabled.
+ 		bool argument_buffers = false;
+@@ -1087,6 +1094,10 @@ protected:
+ 	std::string to_sampler_expression(uint32_t id);
+ 	std::string to_swizzle_expression(uint32_t id);
+ 	std::string to_buffer_size_expression(uint32_t id);
++	void emit_robust_buffer_access_chain(const uint32_t *ops, uint32_t length);
++	void emit_robust_buffer_zero(uint32_t type_id, const std::string &expression, uint32_t depth);
++	uint64_t robust_buffer_access_size(uint32_t type_id, const SPIRType &type, uint32_t matrix_stride,
++	                                 bool row_major, uint32_t component_stride) const;
+ 	bool is_sample_rate() const;
+ 	bool is_intersection_query() const;
+ 	bool is_direct_input_builtin(BuiltIn builtin);
+@@ -1251,6 +1262,15 @@ protected:
+ 	uint32_t next_metal_resource_index_buffer = 0;
+ 	uint32_t next_metal_resource_index_texture = 0;
+ 	uint32_t next_metal_resource_index_sampler = 0;
++
++	// Metal resource indices the app assigned through add_msl_resource_binding(), so that a resource
++	// the app did not explicitly bind is never given an index that is already spoken for.
++	std::unordered_set<uint32_t> claimed_msl_buffer_indices;
++	std::unordered_set<uint32_t> claimed_msl_texture_indices;
++	std::unordered_set<uint32_t> claimed_msl_sampler_indices;
++	void collect_claimed_msl_resource_indices();
++	static uint32_t allocate_unclaimed_msl_resource_index(uint32_t &next_index, uint32_t stride,
++	                                                      const std::unordered_set<uint32_t> &claimed);
+ 	// Intentionally uninitialized, works around MSVC 2013 bug.
+ 	uint32_t next_metal_resource_ids[kMaxArgumentBuffers];
+ 
+-- 
+2.54.0 (Apple Git-157)
+

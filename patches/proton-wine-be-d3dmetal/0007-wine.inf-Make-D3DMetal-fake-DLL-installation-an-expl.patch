@@ -1,0 +1,40 @@
+From 89686a9a3a66837974fa1fc3f3d2e27f16899825 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sun, 25 Oct 2026 21:48:35 -0400
+Subject: [PATCH 07/11] wine.inf: Make D3DMetal fake DLL installation an
+ explicit step.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Provide CrossOver 22435’s atidxx64, nvapi64 and nvngx placeholders in a separate amd64 install section. Keep default prefix updates unchanged so DXVK and MoltenVK prefixes receive no new fake graphics DLLs.
+---
+ loader/wine.inf.in | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index 16b0a2b899b..2fc4810345a 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -767,6 +767,18 @@ HKLM,SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x86,"Version",2,"14.42.344
+ 10,twain_64,sane.ds
+ 10,twain_64,gphoto2.ds
+ 
++; Explicit D3DMetal prefix setup; normal prefix updates do not install these.
++; Run setupapi,InstallHinfSection D3DMetal 128 <path to wine.inf> in a dedicated prefix.
++[D3DMetal]
++
++[D3DMetal.NTamd64]
++WineFakeDlls=D3DMetalFakeDlls
++
++[D3DMetalFakeDlls]
++11,,atidxx64.dll,*
++11,,nvapi64.dll,*
++11,,nvngx.dll,*
++
+ ; Wow64-only fake dlls
+ [FakeDllsWow64]
+ ; create some directories first
+-- 
+2.43.0
+

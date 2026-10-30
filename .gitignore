@@ -1,0 +1,8 @@
+*.log
+*.trace
+*.xml
+*.exe
+# Raw captures and profiler dumps: large, regenerable; keep the PNG/log/README evidence instead.
+*.ppm
+*.sample
+*.sample.txt

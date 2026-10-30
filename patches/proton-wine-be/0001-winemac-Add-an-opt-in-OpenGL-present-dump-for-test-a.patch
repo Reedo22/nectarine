@@ -1,0 +1,102 @@
+From 96b5934e5f518804ddb77e103d57c686806444b5 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sun, 25 Oct 2026 23:11:40 -0400
+Subject: [PATCH] winemac: Add an opt-in OpenGL present dump for test
+ automation.
+
+WINE_DIAG_DUMP_GL_PRESENT=<n> writes every n-th swapped frame (after WINE_DIAG_GL_PRESENT_AFTER
+seconds) to /tmp/mvk-present-<i>.ppm, matching MoltenVK's present dumper, so OpenGL, wined3d,
+DirectDraw and D3D8 games can be frame-verified by the same harness. Inert unless set.
+---
+ dlls/winemac.drv/opengl.c | 61 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 61 insertions(+)
+
+diff --git a/dlls/winemac.drv/opengl.c b/dlls/winemac.drv/opengl.c
+index b5f91492492..800872a88d0 100644
+--- a/dlls/winemac.drv/opengl.c
++++ b/dlls/winemac.drv/opengl.c
+@@ -40,6 +40,9 @@
+ #include <OpenGL/glu.h>
+ #include <OpenGL/CGLRenderers.h>
+ #include <dlfcn.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wgl);
+ 
+@@ -2753,6 +2756,63 @@ static void *macdrv_get_proc_address(const char *name)
+     return dlsym(opengl_handle, name);
+ }
+ 
++/* Nectarine diagnostics: WINE_DIAG_DUMP_GL_PRESENT=<n> writes every n-th swapped frame, starting
++ * WINE_DIAG_GL_PRESENT_AFTER seconds after the first swap, to /tmp/mvk-present-<i>.ppm -- the same
++ * names MoltenVK's present dumper uses, so OpenGL/wined3d games are captured by the same tools. */
++static void diag_dump_swap(struct opengl_drawable *base)
++{
++    static int interval = -1, after, index;
++    static unsigned int count;
++    static time_t start;
++    static void (*p_bind)(GLenum, GLuint);
++    static void (*p_store)(GLenum, GLint);
++    static void (*p_readbuf)(GLenum);
++    GLint old_fbo = 0, old_read = 0;
++    unsigned char *pixels;
++    char path[64];
++    RECT rect;
++    FILE *f;
++    int w, h, y;
++
++    if (interval < 0)
++    {
++        const char *env = getenv("WINE_DIAG_DUMP_GL_PRESENT"), *delay = getenv("WINE_DIAG_GL_PRESENT_AFTER");
++        interval = env ? atoi(env) : 0;
++        after = delay ? atoi(delay) : 0;
++        start = time(NULL);
++        p_bind = dlsym(opengl_handle, "glBindFramebuffer");
++        if (!p_bind) p_bind = dlsym(opengl_handle, "glBindFramebufferEXT");
++        p_store = dlsym(opengl_handle, "glPixelStorei");
++        p_readbuf = dlsym(opengl_handle, "glReadBuffer");
++    }
++    if (interval <= 0 || index >= 24 || time(NULL) - start < after) return;
++    if (count++ % interval) return;
++    if (!base->client || !NtUserGetClientRect(base->client->hwnd, &rect, NtUserGetDpiForWindow(base->client->hwnd))) return;
++    w = rect.right - rect.left;
++    h = rect.bottom - rect.top;
++    if (w < 64 || h < 64 || !p_store || !p_readbuf || !(pixels = malloc(w * h * 3))) return;
++
++    pglGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &old_fbo);
++    pglGetIntegerv(GL_READ_BUFFER, &old_read);
++    if (p_bind) p_bind(GL_READ_FRAMEBUFFER, base->draw_fbo);
++    p_readbuf(base->draw_fbo ? GL_COLOR_ATTACHMENT0 : GL_BACK);
++    p_store(GL_PACK_ALIGNMENT, 1);
++    pglReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, pixels);
++    p_readbuf(old_read);
++    if (p_bind) p_bind(GL_READ_FRAMEBUFFER, old_fbo);
++
++    snprintf(path, sizeof(path), "/tmp/mvk-present-%d.ppm", index);
++    if ((f = fopen(path, "wb")))
++    {
++        fprintf(f, "P6\n%d %d\n255\n", w, h);
++        for (y = h - 1; y >= 0; y--) fwrite(pixels + y * w * 3, 1, w * 3, f);
++        fclose(f);
++        fprintf(stderr, "[gl-diag] present dump %d: %dx%d\n", index, w, h);
++        index++;
++    }
++    free(pixels);
++}
++
+ static BOOL macdrv_surface_swap(struct opengl_drawable *base)
+ {
+     struct macdrv_context *context = NtCurrentTeb()->glReserved2;
+@@ -2760,6 +2820,7 @@ static BOOL macdrv_surface_swap(struct opengl_drawable *base)
+     TRACE("%s context %p/%p/%p\n", debugstr_opengl_drawable(base), context, (context ? context->context : NULL),
+           (context ? context->cglcontext : NULL));
+ 
++    diag_dump_swap(base);
+     macdrv_flush_opengl_context(context->context);
+     return TRUE;
+ }
+-- 
+2.43.0
+

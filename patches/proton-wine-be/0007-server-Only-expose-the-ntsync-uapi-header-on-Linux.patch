@@ -1,0 +1,29 @@
+From 921eb15be79c7228112d009653f029dfe189c718 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:03:02 -0400
+Subject: [PATCH 07/29] server: Only expose the ntsync uapi header on Linux.
+
+---
+ server/ntsync_tmp.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/server/ntsync_tmp.h b/server/ntsync_tmp.h
+index 6d06793512b..fa5244e01b1 100644
+--- a/server/ntsync_tmp.h
++++ b/server/ntsync_tmp.h
+@@ -8,6 +8,7 @@
+ #ifndef __LINUX_NTSYNC_H
+ #define __LINUX_NTSYNC_H
+ 
++#ifdef __linux__ /* nectarine */
+ #include <linux/types.h>
+ 
+ struct ntsync_sem_args {
+@@ -57,3 +58,4 @@ struct ntsync_wait_args {
+ #define NTSYNC_IOC_EVENT_READ		_IOR ('N', 0x8d, struct ntsync_event_args)
+ 
+ #endif
++#endif /* __linux__ nectarine */
+-- 
+2.43.0
+

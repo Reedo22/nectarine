@@ -1,0 +1,122 @@
+diff --git a/dlls/winedmo/Makefile.in b/dlls/winedmo/Makefile.in
+index bee5d80..1cf228f 100644
+--- a/dlls/winedmo/Makefile.in
++++ b/dlls/winedmo/Makefile.in
+@@ -12,7 +12,6 @@ SOURCES = \
+ 	media-converter/fossilize.c \
+ 	media-converter/murmur3.c \
+ 	media-converter/lib.c \
+-	libavcodec/pcm_byte_order_reverse_bsf.c \
+ 	unix_demuxer.c \
+ 	unix_demuxer_mediaconv.c \
+ 	unix_media_type.c \
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index 24681e2..bf351a9 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -37,6 +37,7 @@ static inline const char *debugstr_averr( int err )
+ struct stream
+ {
+     AVBSFContext *filter;
++    unsigned int pcm_sample_bytes;
+     BOOL eos;
+ };
+ 
+@@ -104,19 +105,18 @@ NTSTATUS demuxer_check( void *arg )
+     return STATUS_SUCCESS;
+ }
+ 
+-static BOOL codec_is_big_endian_pcm(enum AVCodecID codec_id)
++/* Use public FFmpeg APIs: AVBSFContext internals are not an extension ABI. */
++static enum AVCodecID little_endian_pcm( enum AVCodecID codec_id )
+ {
+     switch (codec_id)
+     {
+-    case AV_CODEC_ID_PCM_S16BE:
+-    case AV_CODEC_ID_PCM_S24BE:
+-    case AV_CODEC_ID_PCM_S32BE:
+-    case AV_CODEC_ID_PCM_S64BE:
+-    case AV_CODEC_ID_PCM_F32BE:
+-    case AV_CODEC_ID_PCM_F64BE:
+-        return TRUE;
+-    default:
+-        return FALSE;
++    case AV_CODEC_ID_PCM_S16BE: return AV_CODEC_ID_PCM_S16LE;
++    case AV_CODEC_ID_PCM_S24BE: return AV_CODEC_ID_PCM_S24LE;
++    case AV_CODEC_ID_PCM_S32BE: return AV_CODEC_ID_PCM_S32LE;
++    case AV_CODEC_ID_PCM_S64BE: return AV_CODEC_ID_PCM_S64LE;
++    case AV_CODEC_ID_PCM_F32BE: return AV_CODEC_ID_PCM_F32LE;
++    case AV_CODEC_ID_PCM_F64BE: return AV_CODEC_ID_PCM_F64LE;
++    default: return AV_CODEC_ID_NONE;
+     }
+ }
+ 
+@@ -142,18 +142,18 @@ static NTSTATUS demuxer_create_streams( struct demuxer *demuxer )
+                 continue;
+             }
+         }
+-        else if (codec_is_big_endian_pcm(par->codec_id))
++
++        if (av_bsf_get_null_filter( &stream->filter ) < 0) return STATUS_NO_MEMORY;
++        avcodec_parameters_copy( stream->filter->par_in, par );
++        avcodec_parameters_copy( stream->filter->par_out, par );
++        if (little_endian_pcm( par->codec_id ) != AV_CODEC_ID_NONE)
+         {
+-            /* WAVEFORMATEX does not contain endianness info, so this needs to be converted here. */
+-            if (av_bsf_alloc( &ff_pcm_byte_order_reverse_bsf, &stream->filter ) < 0) return STATUS_UNSUCCESSFUL;
+-            avcodec_parameters_copy( stream->filter->par_in, par );
+-            av_bsf_init( stream->filter );
+-            continue;
++            /* WAVEFORMATEX has no byte-order flag. Convert when copying the sample,
++             * so buffer-size retries never reverse the same packet twice. */
++            stream->pcm_sample_bytes = av_get_bits_per_sample( par->codec_id ) / 8;
++            stream->filter->par_out->codec_id = little_endian_pcm( par->codec_id );
+         }
+ 
+-        av_bsf_get_null_filter( &stream->filter );
+-        avcodec_parameters_copy( stream->filter->par_in, demuxer->ctx->streams[i]->codecpar );
+-        avcodec_parameters_copy( stream->filter->par_out, demuxer->ctx->streams[i]->codecpar );
+     }
+ 
+     return STATUS_SUCCESS;
+@@ -405,7 +405,23 @@ NTSTATUS demuxer_read( void *arg )
+     sample->dts = get_stream_time( stream, packet->dts );
+     sample->duration = get_stream_time( stream, packet->duration );
+     if (packet->flags & AV_PKT_FLAG_KEY) sample->flags |= SAMPLE_FLAG_SYNC_POINT;
+-    memcpy( (void *)(UINT_PTR)sample->data, packet->data, packet->size );
++    if (demuxer->streams[packet->stream_index].pcm_sample_bytes)
++    {
++        unsigned int bytes = demuxer->streams[packet->stream_index].pcm_sample_bytes;
++        unsigned int i, j;
++        BYTE *dst = (void *)(UINT_PTR)sample->data;
++
++        if (packet->size % bytes)
++        {
++            av_packet_free( &packet );
++            demuxer->last_packet = NULL;
++            return STATUS_UNSUCCESSFUL;
++        }
++        for (i = 0; i < packet->size; i += bytes)
++            for (j = 0; j < bytes; ++j) dst[i + j] = packet->data[i + bytes - j - 1];
++    }
++    else
++        memcpy( (void *)(UINT_PTR)sample->data, packet->data, packet->size );
+     params->stream = packet->stream_index;
+     av_packet_free( &packet );
+     demuxer->last_packet = NULL;
+diff --git a/dlls/winedmo/unix_private.h b/dlls/winedmo/unix_private.h
+index 8974afd..5339111 100644
+--- a/dlls/winedmo/unix_private.h
++++ b/dlls/winedmo/unix_private.h
+@@ -44,11 +44,6 @@ extern void mediaconv_demuxer_init(void);
+ extern void mediaconv_demuxer_exit(void);
+ extern int mediaconv_demuxer_open( AVFormatContext **ctx, struct stream_context *context );
+ 
+-/* libavcodec/pcm_byte_order_reverse.c */
+-#ifdef HAVE_FFMPEG
+-extern const AVBitStreamFilter ff_pcm_byte_order_reverse_bsf;
+-#endif
+-
+ /* unixlib.c */
+ extern int64_t unix_seek_callback( void *opaque, int64_t offset, int whence );
+ extern int unix_read_callback( void *opaque, uint8_t *buffer, int size );

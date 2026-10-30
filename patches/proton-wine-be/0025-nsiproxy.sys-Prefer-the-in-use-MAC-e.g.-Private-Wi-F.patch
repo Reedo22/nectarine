@@ -1,0 +1,107 @@
+From e4eda59c098b075e5b8dc8d83f31dc1dc3e551a4 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 18:23:33 -0400
+Subject: [PATCH 25/29] nsiproxy.sys: Prefer the in-use MAC (e.g. Private Wi-Fi
+ Address) on macOS.
+
+IOKit only reports the burned-in address; for Wi-Fi the address in use is the
+randomized private one, which is what apps fingerprinting the machine saw before.
+Ask ifconfig (not subject to the placeholder) first, fall back to IOKit, cache.
+---
+ dlls/nsiproxy.sys/ndis_mac.c | 69 +++++++++++++++++++++++++++++++++---
+ 1 file changed, 65 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/nsiproxy.sys/ndis_mac.c b/dlls/nsiproxy.sys/ndis_mac.c
+index 1a18846cfad..1530af2ffab 100644
+--- a/dlls/nsiproxy.sys/ndis_mac.c
++++ b/dlls/nsiproxy.sys/ndis_mac.c
+@@ -24,16 +24,41 @@
+ 
+ #ifdef __APPLE__
+ 
++#include <ctype.h>
++#include <pthread.h>
++#include <stdio.h>
+ #include <string.h>
+ #include <CoreFoundation/CoreFoundation.h>
+ #include <IOKit/IOKitLib.h>
+ #include <IOKit/network/IOEthernetInterface.h>
+ #include <IOKit/network/IOEthernetController.h>
+ 
+-/* macOS hands processes without a privileged identity a placeholder link-layer address
+- * (02:00:00:00:00:00) from sysctl/getifaddrs. IOKit still reports the real one; look it up
+- * by BSD interface name. Returns 1 on success. */
+-int ndis_mac_get_hw_address( const char *bsd_name, unsigned char *addr, unsigned int len )
++/* The address in use, as Apple's own ifconfig reports it. For Wi-Fi this is the Private
++ * Wi-Fi Address, which is what native Windows apps would see as the adapter's MAC (and what
++ * Steam binds its saved login to); IOKit only knows the burned-in address. */
++static int ifconfig_get_address( const char *bsd_name, unsigned char *addr, unsigned int len )
++{
++    char cmd[64], line[256];
++    unsigned int b[6], i;
++    int found = 0;
++    const char *c;
++    FILE *f;
++
++    if (len != 6 || strlen( bsd_name ) > 16) return 0;
++    for (c = bsd_name; *c; c++) if (!isalnum( (unsigned char)*c )) return 0;
++    snprintf( cmd, sizeof(cmd), "/sbin/ifconfig %s 2>/dev/null", bsd_name );
++    if (!(f = popen( cmd, "r" ))) return 0;
++    while (!found && fgets( line, sizeof(line), f ))
++    {
++        if (sscanf( line, " ether %x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5] ) != 6) continue;
++        for (i = 0; i < 6; i++) addr[i] = b[i];
++        found = 1;
++    }
++    pclose( f );
++    return found;
++}
++
++static int iokit_get_address( const char *bsd_name, unsigned char *addr, unsigned int len )
+ {
+     io_iterator_t iter;
+     io_object_t intf;
+@@ -73,4 +98,40 @@ int ndis_mac_get_hw_address( const char *bsd_name, unsigned char *addr, unsigned
+     return found;
+ }
+ 
++/* macOS hands processes without a privileged identity (any ad-hoc signed binary) a
++ * placeholder link-layer address, 02:00:00:00:00:00, from sysctl/getifaddrs. Recover the
++ * real one, preferring the address in use; cache it, since enumeration runs often.
++ * Returns 1 on success. */
++int ndis_mac_get_hw_address( const char *bsd_name, unsigned char *addr, unsigned int len )
++{
++    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++    static struct { char name[17]; unsigned char addr[6]; int ok; } cache[32];
++    static unsigned int count;
++    unsigned int i;
++    int ok = 0;
++
++    if (len != 6) return 0;
++    pthread_mutex_lock( &lock );
++    for (i = 0; i < count; i++)
++        if (!strcmp( cache[i].name, bsd_name ))
++        {
++            if ((ok = cache[i].ok)) memcpy( addr, cache[i].addr, 6 );
++            pthread_mutex_unlock( &lock );
++            return ok;
++        }
++    pthread_mutex_unlock( &lock );
++
++    ok = ifconfig_get_address( bsd_name, addr, len ) || iokit_get_address( bsd_name, addr, len );
++
++    pthread_mutex_lock( &lock );
++    if (count < sizeof(cache) / sizeof(cache[0]) && strlen( bsd_name ) < sizeof(cache[0].name))
++    {
++        strcpy( cache[count].name, bsd_name );
++        if ((cache[count].ok = ok)) memcpy( cache[count].addr, addr, 6 );
++        count++;
++    }
++    pthread_mutex_unlock( &lock );
++    return ok;
++}
++
+ #endif /* __APPLE__ */
+-- 
+2.43.0
+

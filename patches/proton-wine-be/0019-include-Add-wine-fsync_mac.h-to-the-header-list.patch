@@ -1,0 +1,24 @@
+From c4dbcab55cdb0fed57aede2a0b554e86d3de6aa2 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 16:31:37 -0400
+Subject: [PATCH 19/29] include: Add wine/fsync_mac.h to the header list.
+
+---
+ include/Makefile.in | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 435158167fc..ea6abbda2fb 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -969,6 +969,7 @@ SOURCES = \
+ 	wine/epm.idl \
+ 	wine/exception.h \
+ 	wine/fil_data.idl \
++	wine/fsync_mac.h \
+ 	wine/gdi_driver.h \
+ 	wine/glu.h \
+ 	wine/hid.h \
+-- 
+2.43.0
+

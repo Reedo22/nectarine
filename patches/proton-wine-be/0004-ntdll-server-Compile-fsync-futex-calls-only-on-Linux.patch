@@ -1,0 +1,74 @@
+From 64b1f5aaaf329d62c19fa185d5df9456ae5243b7 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 12:51:18 -0400
+Subject: [PATCH 04/29] ntdll, server: Compile fsync futex calls only on Linux.
+
+fsync_check_support() already returns 0 off Linux, so this code never
+runs on macOS; never issue raw syscall 449 there (it is a different call).
+---
+ dlls/ntdll/unix/fsync.c | 14 ++++++++++++++
+ server/fsync.c          |  5 +++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/dlls/ntdll/unix/fsync.c b/dlls/ntdll/unix/fsync.c
+index 25d41cac793..0e19a08dd13 100644
+--- a/dlls/ntdll/unix/fsync.c
++++ b/dlls/ntdll/unix/fsync.c
+@@ -141,15 +141,25 @@ static void simulate_sched_quantum(void)
+ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+         int count, const struct timespec64 *end, clockid_t clock_id )
+ {
++#ifdef __linux__
+    if (end)
+         return syscall( __NR_futex_waitv, futexes, count, 0, end, clock_id );
+    else
+         return syscall( __NR_futex_waitv, futexes, count, 0, NULL, 0 );
++#else
++   errno = ENOSYS;
++   return -1;
++#endif
+ }
+ 
+ static inline int futex_wake( int *addr, int val )
+ {
++#ifdef __linux__
+     return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
++#else
++    errno = ENOSYS;
++    return -1;
++#endif
+ }
+ 
+ struct fsync
+@@ -456,7 +466,11 @@ void fsync_init( DWORD pid )
+ 
+ 
+     fsync_enabled = 1;
++#ifdef __linux__
+     syscall( __NR_futex_waitv, NULL, 0, 0, NULL, 0 );
++#else
++    errno = ENOSYS;
++#endif
+     if (errno == ENOSYS || errno == EPERM)
+     {
+         ERR("Server is running with WINEFSYNC but this process can't use __NR_futex_waitv.\n");
+diff --git a/server/fsync.c b/server/fsync.c
+index 7d3ec646f9e..362c4064a0c 100644
+--- a/server/fsync.c
++++ b/server/fsync.c
+@@ -310,7 +310,12 @@ int fsync_grab_shm_idx( unsigned int shm_idx )
+ 
+ static inline int futex_wake( int *addr, int val )
+ {
++#ifdef __linux__
+     return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
++#else
++    errno = ENOSYS;
++    return -1;
++#endif
+ }
+ 
+ /* shm layout for events or event-like objects. */
+-- 
+2.43.0
+

@@ -1,0 +1,51 @@
+From b4cd19476e4eef23f45b9a4a4f919800e6d70104 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 18:45:04 -0400
+Subject: [PATCH 26/29] wine.inf: Do not install Proton's fake Steam registry.
+
+The SteamClient sections overwrite a real Windows Steam install's registry
+(ActiveProcess pid 0xfffe, client DLL paths) on every prefix update; on macOS the
+real client runs in the prefix and stalls.
+---
+ loader/wine.inf.in | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index 0aee5cfe8e0..ad8174f8703 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -73,7 +73,6 @@ AddReg=\
+     ProtonOverrides,\
+     Services, \
+     SessionMgr,\
+-    SteamClient,\
+     ThemeManager
+ 
+ [DefaultInstall]
+@@ -102,7 +101,6 @@ WineFakeDlls=FakeDllsWin64
+ AddReg=\
+     CurrentVersionWow64.ntamd64,\
+     Packages.ntamd64,\
+-    SteamClient64, \
+     VCRuntime.ntamd64,\
+     VersionInfo
+ 
+@@ -112,7 +110,6 @@ WineFakeDlls=FakeDllsWin64
+ AddReg=\
+     CurrentVersionWow64.ntarm64,\
+     Packages.ntarm64,\
+-    SteamClient64, \
+     VCRuntime.ntamd64,\
+     VCRuntime.ntarm64,\
+     VersionInfo
+@@ -135,7 +132,6 @@ Needs=BaseWow64Install
+ AddReg=\
+     CurrentVersionWow64.ntx86,\
+     Packages.wow64,\
+-    SteamClient64, \
+     VCRuntime.ntamd64,\
+     VCRuntime.ntx86
+ 
+-- 
+2.43.0
+

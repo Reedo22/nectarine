@@ -1,0 +1,26 @@
+From 1353b2d72a5d6b076497c5d09197d119a3848b73 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 18:57:44 -0400
+Subject: [PATCH 28/29] nsiproxy.sys: Use the literal IOKit BSD name key.
+
+kIOBSDNameKey lives in IOKit/IOBSD.h, which is not included.
+---
+ dlls/nsiproxy.sys/ndis_mac.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/dlls/nsiproxy.sys/ndis_mac.c b/dlls/nsiproxy.sys/ndis_mac.c
+index 1530af2ffab..1bd7dfa1aeb 100644
+--- a/dlls/nsiproxy.sys/ndis_mac.c
++++ b/dlls/nsiproxy.sys/ndis_mac.c
+@@ -70,7 +70,7 @@ static int iokit_get_address( const char *bsd_name, unsigned char *addr, unsigne
+     while (!found && (intf = IOIteratorNext( iter )))
+     {
+         char name[64];
+-        CFStringRef bsd = IORegistryEntryCreateCFProperty( intf, CFSTR( kIOBSDNameKey ), kCFAllocatorDefault, 0 );
++        CFStringRef bsd = IORegistryEntryCreateCFProperty( intf, CFSTR( "BSD Name" ), kCFAllocatorDefault, 0 );
+ 
+         if (bsd && CFStringGetCString( bsd, name, sizeof(name), kCFStringEncodingUTF8 ) && !strcmp( name, bsd_name ))
+         {
+-- 
+2.43.0
+

@@ -1,0 +1,433 @@
+diff --git a/spirv_common.hpp b/spirv_common.hpp
+--- a/spirv_common.hpp
++++ b/spirv_common.hpp
+@@ -793,6 +793,15 @@
+ 
+ 	std::string expression;
+ 	TypeID expression_type = 0;
++
++	// Optional MSL predicate guarding an access into a descriptor-backed buffer.
++	// The MSL backend populates this when it can derive the descriptor bound.
++	std::string robust_buffer_access_condition;
++	std::string robust_buffer_byte_offset;
++	std::string robust_buffer_index_condition;
++	uint32_t robust_buffer_matrix_stride = 0;
++	uint32_t robust_buffer_component_stride = 0;
++	bool robust_buffer_row_major = false;
+ 
+ 	// If this expression is a forwarded load,
+ 	// allow us to reference the original variable.
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -9449,6 +9449,153 @@
+ 	return false;
+ }
+ 
++// Size in the SPIR-V storage layout, rather than sizeof(the thread-local value).
++uint64_t CompilerMSL::robust_buffer_access_size(uint32_t type_id, const SPIRType &type, uint32_t matrix_stride,
++                                               bool row_major, uint32_t component_stride) const
++{
++	if (!type.array.empty())
++	{
++		uint32_t count = type.array_size_literal.back() ? type.array.back() : evaluate_constant_u32(type.array.back());
++		return uint64_t(get_decoration(type_id, DecorationArrayStride)) * count;
++	}
++	if (type.basetype == SPIRType::Struct)
++		return get_declared_struct_size(type);
++	uint64_t scalar_size = type.width / 8;
++	if (type.columns > 1)
++	{
++		uint64_t major_count = row_major ? type.vecsize : type.columns;
++		uint64_t minor_count = row_major ? type.columns : type.vecsize;
++		return (major_count - 1) * matrix_stride + minor_count * scalar_size;
++	}
++	return (type.vecsize - 1) * (component_stride ? component_stride : scalar_size) + scalar_size;
++}
++
++// Loads in loops may reuse a hoisted temporary. Reset it for every execution,
++// including the out-of-range iteration after an earlier in-range iteration.
++void CompilerMSL::emit_robust_buffer_zero(uint32_t type_id, const string &expression, uint32_t depth)
++{
++	auto &type = get<SPIRType>(type_id);
++	if (!type.array.empty())
++	{
++		auto count = type.array_size_literal.back() ? convert_to_string(type.array.back()) : to_expression(type.array.back());
++		auto index = join("spvRobustZeroIndex", depth);
++		statement("for (uint ", index, " = 0; ", index, " < ", count, "; ++", index, ")");
++		begin_scope();
++		emit_robust_buffer_zero(type.parent_type, join(expression, "[", index, "]"), depth + 1);
++		end_scope();
++	}
++	else
++		statement(expression, " = {};");
++}
++
++void CompilerMSL::emit_robust_buffer_access_chain(const uint32_t *ops, uint32_t length, bool pointer_access)
++{
++	auto *var = maybe_get_backing_variable(ops[2]);
++	auto *result = maybe_get<SPIRExpression>(ops[1]);
++	if (!var || !result || (var->storage != StorageClassStorageBuffer &&
++	    !(var->storage == StorageClassUniform &&
++	      (has_decoration(get_variable_data_type(*var).self, DecorationBufferBlock) ||
++	       has_decoration(get_variable_data_type(*var).self, DecorationBlock)))))
++		return;
++	// Descriptor arrays have a separate descriptor index and require their selected
++	// size expression, not the containing variable's size. Keep the existing path.
++	if (!get_variable_data_type(*var).array.empty())
++		return;
++	auto *base = maybe_get<SPIRExpression>(ops[2]);
++	string offset = base && !base->robust_buffer_byte_offset.empty() ? base->robust_buffer_byte_offset : "0ul";
++	string indices = base ? base->robust_buffer_index_condition : string();
++	uint32_t matrix_stride = base ? base->robust_buffer_matrix_stride : 0;
++	uint32_t component_stride = base ? base->robust_buffer_component_stride : 0;
++	bool row_major = base && base->robust_buffer_row_major;
++	uint32_t type_id = get_pointee_type_id(expression_type_id(ops[2]));
++	const SPIRType *type = &get<SPIRType>(type_id);
++	auto append_condition = [&](const string &condition) {
++		indices = indices.empty() ? condition : join("(", indices, " && ", condition, ")");
++	};
++	auto size = to_buffer_size_expression(var->self);
++	uint32_t first_index = 3;
++	if (pointer_access)
++	{
++		// OpPtrAccessChain's Element operand advances by whole pointee objects
++		// before its ordinary member/array indices. Bound before multiplying.
++		if (length < 4)
++			return;
++		uint32_t element_stride = get_decoration(expression_type_id(ops[2]), DecorationArrayStride);
++		if (!element_stride)
++			return;
++		auto element = join("ulong(", to_expression(ops[3]), ")");
++		append_condition(join("(", element, " <= ulong(", size, ") / ", element_stride, "ul)"));
++		offset = join("(", offset, " + ", element, " * ", element_stride, "ul)");
++		first_index = 4;
++	}
++	for (uint32_t i = first_index; i < length; i++)
++	{
++		uint32_t index_id = ops[i];
++		if (!type->array.empty())
++		{
++			uint32_t stride = get_decoration(type_id, DecorationArrayStride);
++			if (!stride)
++				return;
++			auto index = join("ulong(", to_expression(index_id), ")");
++			// Check before multiplying, so an invalid large/negative index cannot wrap.
++			append_condition(join("(", index, " <= ulong(", size, ") / ", stride, "ul)"));
++			if (type->op != OpTypeRuntimeArray)
++			{
++				auto count = type->array_size_literal.back() ? convert_to_string(type->array.back()) : to_expression(type->array.back());
++				append_condition(join("(", index, " < ulong(", count, "))"));
++			}
++			offset = join("(", offset, " + ", index, " * ", stride, "ul)");
++			type_id = type->parent_type;
++			type = &get<SPIRType>(type_id);
++		}
++		else if (type->basetype == SPIRType::Struct)
++		{
++			auto *member = maybe_get<SPIRConstant>(index_id);
++			if (!member || member->scalar() >= type->member_types.size())
++				return;
++			uint32_t index = member->scalar();
++			offset = join("(", offset, " + ", get_member_decoration(type->self, index, DecorationOffset), "ul)");
++			matrix_stride = get_member_decoration(type->self, index, DecorationMatrixStride);
++			row_major = has_member_decoration(type->self, index, DecorationRowMajor);
++			component_stride = 0;
++			type_id = type->member_types[index];
++			type = &get<SPIRType>(type_id);
++		}
++		else if (type->columns > 1)
++		{
++			auto index = join("ulong(", to_expression(index_id), ")");
++			append_condition(join("(", index, " < ", type->columns, "ul)"));
++			uint32_t stride = row_major ? type->width / 8 : matrix_stride;
++			component_stride = row_major ? matrix_stride : type->width / 8;
++			offset = join("(", offset, " + ", index, " * ", stride, "ul)");
++			type_id = type->parent_type;
++			type = &get<SPIRType>(type_id);
++		}
++		else if (type->vecsize > 1)
++		{
++			auto index = join("ulong(", to_expression(index_id), ")");
++			append_condition(join("(", index, " < ", type->vecsize, "ul)"));
++			offset = join("(", offset, " + ", index, " * ", component_stride ? component_stride : type->width / 8, "ul)");
++			type_id = type->parent_type;
++			type = &get<SPIRType>(type_id);
++			component_stride = 0;
++		}
++		else
++			return;
++	}
++	uint64_t access_size = robust_buffer_access_size(type_id, *type, matrix_stride, row_major, component_stride);
++	if (!access_size)
++		return;
++	result->robust_buffer_byte_offset = offset;
++	result->robust_buffer_index_condition = indices;
++	result->robust_buffer_matrix_stride = matrix_stride;
++	result->robust_buffer_component_stride = component_stride;
++	result->robust_buffer_row_major = row_major;
++	auto range = join("(ulong(", size, ") >= ", access_size, "ul && ", offset,
++	                  " <= ulong(", size, ") - ", access_size, "ul)");
++	result->robust_buffer_access_condition = indices.empty() ? range : join("(", indices, " && ", range, ")");
++}
++
+ // Override for MSL-specific syntax instructions
+ void CompilerMSL::emit_instruction(const Instruction &instruction)
+ {
+@@ -9512,7 +9642,30 @@
+ 				// Sample mask input for Metal is not an array
+ 				if (is_sample_mask)
+ 					set_decoration(id, DecorationBuiltIn, BuiltInSampleMask);
+-				CompilerGLSL::emit_instruction(instruction);
++				auto *ptr_expr = maybe_get<SPIRExpression>(ptr);
++				if (ptr_expr && !ptr_expr->robust_buffer_access_condition.empty())
++				{
++					// Keep the common load path's physical-type conversion, packed vectors,
++					// row-major matrices and array copies. Only execute it when in range.
++					auto condition = ptr_expr->robust_buffer_access_condition;
++					bool zero_initialize = options.force_zero_initialized_variables;
++					options.force_zero_initialized_variables = true;
++					emit_uninitialized_temporary_expression(ops[0], id);
++					options.force_zero_initialized_variables = zero_initialize;
++					emit_robust_buffer_zero(ops[0], to_expression(id), 0);
++					bool hoisted = hoisted_temporaries.insert(id).second;
++					bool forced = forced_temporaries.insert(id).second;
++					statement("if (", condition, ")");
++					begin_scope();
++					CompilerGLSL::emit_instruction(instruction);
++					end_scope();
++					if (hoisted)
++						hoisted_temporaries.erase(id);
++					if (forced)
++						forced_temporaries.erase(id);
++				}
++				else
++					CompilerGLSL::emit_instruction(instruction);
+ 			}
+ 		}
+ 		break;
+@@ -10132,6 +10285,90 @@
+ 		}
+ 		else
+ 			CompilerGLSL::emit_instruction(instruction);
++		if (msl_options.robust_buffer_access)
++			emit_robust_buffer_access_chain(ops, instruction.length, opcode == OpPtrAccessChain);
++		if (opcode != OpPtrAccessChain && msl_options.robust_buffer_access &&
++		    maybe_get_backing_variable(ops[2]) &&
++		    !get_variable_data_type(*maybe_get_backing_variable(ops[2])).array.empty())
++		{
++			uint32_t ptr_id = ops[2];
++			auto *result_expr = maybe_get<SPIRExpression>(ops[1]);
++			auto *base_expr = maybe_get<SPIRExpression>(ptr_id);
++			if (result_expr && base_expr)
++				result_expr->robust_buffer_access_condition = base_expr->robust_buffer_access_condition;
++			else if (result_expr)
++				result_expr->robust_buffer_access_condition.clear();
++
++			uint32_t type_id = expression_type_id(ptr_id);
++			const SPIRType *type = &get_pointee_type(type_id);
++			type_id = type->self;
++			auto *buffer_var = maybe_get_backing_variable(ptr_id);
++			uint32_t byte_offset = 0;
++			string descriptor_index;
++			bool descriptor_array_indexed = false;
++			for (uint32_t i = 3; i < instruction.length; i++)
++			{
++				uint32_t index_id = ops[i];
++				if (!type->array.empty() && !descriptor_array_indexed)
++				{
++					// The outer resource array selects a descriptor, not a byte offset
++					// inside the selected buffer. Select the matching size entry below.
++					if (!descriptor_array_indexed)
++					{
++						descriptor_index = to_expression(index_id);
++						descriptor_array_indexed = true;
++						if (!type->array_size_literal.empty())
++						{
++							auto count = type->array_size_literal.back() ? convert_to_string(type->array.back()) : to_expression(type->array.back());
++							if (type->op == OpTypeRuntimeArray && buffer_var)
++								count = convert_to_string(get_resource_array_size(*type, buffer_var->self));
++							auto descriptor_range = join("(ulong(", descriptor_index, ") < ulong(", count, "))");
++							if (result_expr && !result_expr->robust_buffer_access_condition.empty())
++								result_expr->robust_buffer_access_condition = join("(", result_expr->robust_buffer_access_condition, " && ", descriptor_range, ")");
++							else if (result_expr)
++								result_expr->robust_buffer_access_condition = descriptor_range;
++						}
++					}
++					type_id = type->parent_type;
++					type = &get<SPIRType>(type_id);
++				}
++				else if (type->basetype == SPIRType::Struct)
++				{
++					auto *member = maybe_get<SPIRConstant>(index_id);
++					if (!member || member->scalar() >= type->member_types.size())
++						break;
++					uint32_t member_index = member->scalar();
++					byte_offset += get_member_decoration(type->self, member_index, DecorationOffset);
++					type_id = type->member_types[member_index];
++					type = &get<SPIRType>(type_id);
++				}
++				else if (type->op == OpTypeRuntimeArray)
++				{
++					if (buffer_var && result_expr)
++					{
++						uint32_t stride = get_decoration(type_id, DecorationArrayStride);
++						if (stride)
++						{
++							auto size = to_buffer_size_expression(buffer_var->self);
++							if (descriptor_array_indexed)
++								size = join(size, "[", descriptor_index, "]");
++							auto index = join("ulong(", to_expression(index_id), ")");
++							auto available = byte_offset ? join("(", size, " >= ", byte_offset, "u ? (", size, " - ", byte_offset, "u) : 0u)") : size;
++							auto bound = join("(", available, " / ", stride, "u)");
++							auto condition = join("(", index, " < ulong(", bound, "))");
++							if (!result_expr->robust_buffer_access_condition.empty())
++								result_expr->robust_buffer_access_condition = join("(", result_expr->robust_buffer_access_condition, " && ", condition, ")");
++							else
++								result_expr->robust_buffer_access_condition = condition;
++						}
++					}
++					type_id = type->parent_type;
++					type = &get<SPIRType>(type_id);
++				}
++				else
++					break;
++			}
++		}
+ 		fix_up_interpolant_access_chain(ops, instruction.length);
+ 		break;
+ 
+@@ -10157,8 +10374,17 @@
+ 			statement("if (!", builtin_to_glsl(BuiltInHelperInvocation, StorageClassInput), ")");
+ 			begin_scope();
+ 		}
++		auto *ptr_expr = maybe_get<SPIRExpression>(ops[0]);
++		bool robust_store = ptr_expr && !ptr_expr->robust_buffer_access_condition.empty();
++		if (robust_store)
++		{
++			statement("if (", ptr_expr->robust_buffer_access_condition, ")");
++			begin_scope();
++		}
+ 		if (!maybe_emit_array_assignment(ops[0], ops[1]))
+ 			CompilerGLSL::emit_instruction(instruction);
++		if (robust_store)
++			end_scope();
+ 		if (needs_frag_discard_checks() &&
+ 		    (type.storage == StorageClassStorageBuffer || type.storage == StorageClassUniform))
+ 			end_scope();
+@@ -11360,6 +11586,8 @@
+ 
+ 	auto &ptr_type = expression_type(obj);
+ 	auto &type = get_pointee_type(ptr_type);
++	auto *access_expr = maybe_get<SPIRExpression>(obj);
++	const string &robust_condition = access_expr ? access_expr->robust_buffer_access_condition : string();
+ 	auto expected_type = type.basetype;
+ 	if (opcode == OpAtomicUMax || opcode == OpAtomicUMin)
+ 		expected_type = to_unsigned_basetype(type.width);
+@@ -11417,6 +11645,13 @@
+ 		}
+ 		else
+ 			exp = join("(!", builtin_to_glsl(BuiltInHelperInvocation, StorageClassInput), " ? ");
++	}
++	if (!robust_condition.empty() && is_atomic_compare_exchange_strong)
++	{
++		emit_uninitialized_temporary_expression(result_type, result_id);
++		statement(to_expression(result_id), " = ", type_to_glsl(get<SPIRType>(result_type)), "(0);");
++		statement("if (", robust_condition, ")");
++		begin_scope();
+ 	}
+ 
+ 	if (use_native_image_atomic)
+@@ -11549,7 +11784,7 @@
+ 		// the CAS loop, otherwise it will loop infinitely, with the comparison test always failing.
+ 		// The function updates the comparator value from the memory value, so the additional
+ 		// comparison test evaluates the memory value against the expected value.
+-		if (!check_discard)
++		if (!check_discard && robust_condition.empty())
+ 		{
+ 			emit_uninitialized_temporary_expression(result_type, result_id);
+ 			if (vec4_temporary_id)
+@@ -11620,14 +11855,28 @@
+ 			exp += ")";
+ 		}
+ 
++		if (!robust_condition.empty() && strcmp(op, "atomic_store") != 0)
++			exp = join("(", robust_condition, " ? (", exp, ") : ", type_to_glsl(get<SPIRType>(result_type)), "(0))");
++
+ 		if (expected_type != type.basetype)
+ 			exp = bitcast_expression(type, expected_type, exp);
+ 
+ 		if (strcmp(op, "atomic_store") != 0)
+ 			emit_op(result_type, result_id, exp, false);
+ 		else
++		{
++			if (!robust_condition.empty())
++			{
++				statement("if (", robust_condition, ")");
++				begin_scope();
++			}
+ 			statement(exp, ";");
+-	}
++			if (!robust_condition.empty())
++				end_scope();
++		}
++	}
++	if (!robust_condition.empty() && is_atomic_compare_exchange_strong)
++		end_scope();
+ 
+ 	flush_all_atomic_capable_variables();
+ }
+@@ -15480,5 +15764,5 @@
+-		else if ((var.storage == StorageClassStorageBuffer || (var.storage == StorageClassUniform && ssbo)) &&
++		else if ((var.storage == StorageClassStorageBuffer || (var.storage == StorageClassUniform && (ssbo || has_decoration(get_variable_data_type(var).self, DecorationBlock)))) &&
+ 		         !is_hidden_variable(var))
+ 		{
+-			if (buffer_requires_array_length(var.self))
++			if (buffer_requires_array_length(var.self) || (msl_options.robust_buffer_access && var.storage == StorageClassUniform && has_decoration(type.self, DecorationBlock)))
+ 			{
+@@ -19196,6 +19445,12 @@
+ 		uint32_t result_type = args[0];
+ 		uint32_t id = args[1];
+ 		uint32_t ptr = args[2];
++		auto *var = self.maybe_get_backing_variable(ptr);
++		if (self.msl_options.robust_buffer_access && var && (var->storage == StorageClassStorageBuffer ||
++		            (var->storage == StorageClassUniform &&
++		             (self.has_decoration(self.get_variable_data_type(*var).self, DecorationBufferBlock) ||
++		              self.has_decoration(self.get_variable_data_type(*var).self, DecorationBlock)))))
++			self.buffers_requiring_array_length.insert(var->self);
+ 
+ 		set<SPIRExpression>(id, "", result_type, true);
+ 		self.register_read(id, ptr, true);
+@@ -20138,7 +20428,7 @@
+ 			// Check if this descriptor set needs a swizzle buffer.
+ 			if (needs_swizzle_buffer_def && is_sampled_image_type(type))
+ 				set_needs_swizzle_buffer[desc_set] = true;
+-			else if (buffer_requires_array_length(var_id))
++			else if (buffer_requires_array_length(var_id) || (msl_options.robust_buffer_access && var.storage == StorageClassUniform && has_decoration(type.self, DecorationBlock)))
+ 			{
+ 				set_needs_buffer_sizes[desc_set] = true;
+ 				needs_buffer_sizes = true;
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -341,6 +343,9 @@
+ 		bool dispatch_base = false;
+ 		bool texture_1D_as_2D = false;
+ 		bool emulate_reversed_depth_viewport = false;
++
++		// Guard descriptor-backed buffer accesses when Vulkan robustBufferAccess is enabled.
++		bool robust_buffer_access = false;
+ 
+ 		// Enable use of Metal argument buffers.
+ 		// MSL 2.0 must also be enabled.
+@@ -1087,6 +1092,10 @@
+ 	std::string to_sampler_expression(uint32_t id);
+ 	std::string to_swizzle_expression(uint32_t id);
+ 	std::string to_buffer_size_expression(uint32_t id);
++	void emit_robust_buffer_access_chain(const uint32_t *ops, uint32_t length, bool pointer_access);
++	void emit_robust_buffer_zero(uint32_t type_id, const std::string &expression, uint32_t depth);
++	uint64_t robust_buffer_access_size(uint32_t type_id, const SPIRType &type, uint32_t matrix_stride,
++	                                 bool row_major, uint32_t component_stride) const;
+ 	bool is_sample_rate() const;
+ 	bool is_intersection_query() const;
+ 	bool is_direct_input_builtin(BuiltIn builtin);

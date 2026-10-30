@@ -1,0 +1,433 @@
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index d4939dd4976..9cdc84b5893 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -63,6 +63,8 @@
+ #endif
+ #ifdef __APPLE__
+ # include <CoreFoundation/CoreFoundation.h>
++# include <sys/file.h>
++# include "wine/nectarine_backend.h"
+ # define LoadResource MacLoadResource
+ # define GetCurrentThread MacGetCurrentThread
+ # include <CoreServices/CoreServices.h>
+@@ -137,8 +139,8 @@ SECTION_IMAGE_INFORMATION main_image_info = { NULL };
+ #if defined(__APPLE__) && defined(__x86_64__)
+ /* Selected once in __wine_main(), before any Wine thread enters PE code. */
+ BOOL use_macos_pthread_gsbase;
+-/* engine directory with Apple's D3DMetal builtins; searched before dll_dir in D3DMetal processes */
+-static char *d3dmetal_dll_dir;
++/* Selected backend builtins, searched before the default engine DLL directory. */
++static char *graphics_dll_dir;
+ #endif
+ 
+ /* die on a fatal error; use only during initialization */
+@@ -322,7 +324,7 @@ static void set_dll_path(void)
+     dll_paths = malloc( (count + 3) * sizeof(*dll_paths) );
+     count = 0;
+ 
+-    if (d3dmetal_dll_dir) dll_paths[count++] = d3dmetal_dll_dir;
++    if (graphics_dll_dir) dll_paths[count++] = graphics_dll_dir;
+     if (!build_dir) dll_paths[count++] = dll_dir;
+ 
+     if (path)
+@@ -2905,7 +2907,7 @@ static BOOL pe_is_x86_64( const char *path )
+ }
+ 
+ /* Does the 64-bit PE image at path import d3d12.dll? */
+-static BOOL pe_imports_d3d12( const char *path )
++static BOOL pe_imports_graphics( const char *path, const char *dll )
+ {
+     IMAGE_DOS_HEADER dos;
+     IMAGE_NT_HEADERS64 nt;
+@@ -2937,7 +2939,7 @@ static BOOL pe_imports_d3d12( const char *path )
+         if (!(noff = RVA_TO_OFF( desc.Name ))) continue;
+         memset( name, 0, sizeof(name) );
+         if (pread( fd, name, sizeof(name) - 1, noff ) <= 0) continue;
+-        if (!strcasecmp( name, "d3d12.dll" )) { ret = TRUE; break; }
++        if (!strcasecmp( name, dll )) { ret = TRUE; break; }
+     }
+ #undef RVA_TO_OFF
+ done:
+@@ -2945,6 +2947,11 @@ done:
+     return ret;
+ }
+ 
++static BOOL pe_imports_d3d12( const char *path )
++{
++    return pe_imports_graphics( path, "d3d12.dll" );
++}
++
+ /* Does the image ship Microsoft's D3D12 Agility SDK next to it (Unreal 5, Unity 2021+ do)?
+  * Those engines load d3d12.dll at runtime, so the import check alone misses them. */
+ static BOOL ships_d3d12_runtime( const char *image )
+@@ -2963,6 +2970,137 @@ static BOOL ships_d3d12_runtime( const char *image )
+     return FALSE;
+ }
+ 
++/* The lock lives on a separate inode because state updates use rename(). It is
++ * CLOEXEC: the preloader re-exec must re-read the same state, not advance it.
++ * We publish trying only after check_command_line() returns in the final loader. */
++static int backend_lock = -1;
++
++static BOOL select_fallback_backend( int argc, char *argv[], const char *image )
++{
++    static const char *names[] = { "d3dmetal", "dxmt", "dxvk" };
++    const char *forced = getenv( "NECTARINE_BACKEND" );
++    const char *automatic = getenv( "NECTARINE_BACKEND_AUTO" );
++    const char *prefix = getenv( "WINEPREFIX" ), *dir = NULL, *identity;
++    char canonical[4096], root[4096], path[4096], lock[4102], owner[32];
++    char phase[16], previous[16];
++    unsigned long long hash = 14695981039346656037ULL;
++    BOOL d3d11 = FALSE, d3d12 = FALSE, d3d9 = FALSE, eligible;
++    int i, index = 0;
++    FILE *file;
++
++    unsetenv( "_NECTARINE_BACKEND_STATE" );
++    unsetenv( "_NECTARINE_BACKEND_OWNER" );
++    if (!forced && (!automatic || strcmp( automatic, "1" ))) return FALSE;
++    /* Resolve relative Steam launches before applying client exclusions. Games in
++     * steamapps remain eligible; Steam's other executables must never own trials. */
++    identity = image && realpath( image, canonical ) ? canonical : image;
++    eligible = identity && pe_is_x86_64( identity ) &&
++               (!strcasestr( identity, "/steam/" ) || strcasestr( identity, "/steam/steamapps/" )) &&
++               !strcasestr( image, "/steam/bin/" ) &&
++               !strcasestr( image, "steamwebhelper" ) && !strcasestr( image, "/steam.exe" ) &&
++               !strcasestr( image, "/windows/" ) && !strcasestr( image, "unitycrashhandler" ) &&
++               !strcasestr( image, "crashreportclient" );
++    for (i = 1; i < argc; i++)
++    {
++        if (!strcasecmp( argv[i], "-dx11" ) || !strcasecmp( argv[i], "-d3d11" ) ||
++            !strcasecmp( argv[i], "-force-d3d11" )) d3d11 = TRUE;
++        if (!strcasecmp( argv[i], "-dx12" ) || !strcasecmp( argv[i], "-d3d12" ) ||
++            !strcasecmp( argv[i], "-force-d3d12" )) d3d12 = TRUE;
++        if (!strcasecmp( argv[i], "-dx9" ) || !strcasecmp( argv[i], "-d3d9" ) ||
++            !strcasecmp( argv[i], "-force-d3d9" ) || !strcasecmp( argv[i], "-force-opengl" ) ||
++            !strcasecmp( argv[i], "-force-glcore" ) || !strcasecmp( argv[i], "-force-vulkan" )) d3d9 = TRUE;
++    }
++    if (eligible && !d3d11 && !d3d12 && pe_imports_graphics( image, "d3d9.dll" ) &&
++        !pe_imports_graphics( image, "d3d11.dll" ) && !pe_imports_graphics( image, "d3d10.dll" ) &&
++        !pe_imports_d3d12( image )) d3d9 = TRUE;
++    if (!eligible)
++    {
++        if (getenv( "NECTARINE_GRAPHICS_TRACE" ))
++            fprintf( stderr, "wine: backend-trial=excluded state=none image=%s\n", image ? image : "" );
++        /* Preserve the existing selection and threading mode of Steam and Wine
++         * infrastructure. They do not participate in game health tracking. */
++        return FALSE;
++    }
++    if (d3d9)
++    {
++        /* Even the always-D3DMetal policy must leave these on the default path. */
++        const char *def = getenv( "NECTARINE_DEFAULT_BACKEND" );
++        if (def) setenv( "CX_ACTIVE_GRAPHICS_BACKEND", def, 1 );
++        else unsetenv( "CX_ACTIVE_GRAPHICS_BACKEND" );
++        if (getenv( "NECTARINE_GRAPHICS_TRACE" ))
++            fprintf( stderr, "wine: graphics=%s excluded=1 state=none image=%s\n",
++                     def ? def : "default", image ? image : "" );
++        return TRUE;
++    }
++    d3d12 = d3d12 || (!d3d11 && (pe_imports_d3d12( image ) || ships_d3d12_runtime( image )));
++    if (forced)
++    {
++        for (index = 0; index < 3; index++) if (!strcmp( forced, names[index] )) break;
++        if (index == 3)
++        {
++            fprintf( stderr, "wine: invalid NECTARINE_BACKEND=%s; using automatic selection\n", forced );
++            forced = NULL;
++            index = 0;
++        }
++    }
++    path[0] = 0;
++    if (realpath( image, canonical ))
++    {
++        const unsigned char *c;
++        for (c = (unsigned char *)canonical; *c; c++) hash = (hash ^ *c) * 1099511628211ULL;
++        if (!prefix)
++        {
++            const char *home = getenv( "HOME" );
++            if (!home) goto selected;
++            if (snprintf( root, sizeof(root), "%s/.wine", home ) >= (int)sizeof(root)) goto selected;
++            prefix = root;
++        }
++        if (snprintf( path, sizeof(path), "%s/nectarine", prefix ) >= (int)sizeof(path)) goto selected;
++        if (mkdir( path, 0700 ) && errno != EEXIST) goto selected;
++        if (snprintf( path, sizeof(path), "%s/nectarine/backends", prefix ) >= (int)sizeof(path)) goto selected;
++        if (mkdir( path, 0700 ) && errno != EEXIST) goto selected;
++        if (snprintf( path, sizeof(path), "%s/nectarine/backends/%016llx%s.state", prefix, hash, d3d12 ? "-d3d12" : "" ) >= (int)sizeof(path)) goto selected;
++        snprintf( lock, sizeof(lock), "%s.lock", path );
++        backend_lock = open( lock, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600 );
++        if (backend_lock == -1 || flock( backend_lock, LOCK_EX | LOCK_NB ))
++        {
++            if (backend_lock != -1) close( backend_lock );
++            backend_lock = -1;
++            /* Another instance owns the trial. Reuse its choice without changing state. */
++        }
++        if (!forced && (file = fopen( path, "r" )))
++        {
++            if (fscanf( file, "%15s %15s", phase, previous ) == 2 &&
++                (!strcmp( phase, "trying" ) || !strcmp( phase, "good" )))
++            {
++                for (i = 0; i < 3; i++) if (!strcmp( previous, names[i] )) break;
++                if (!strcmp( previous, "vkd3d" ) && d3d12) i = 2;
++                if (i < 3) index = i + (!strcmp( phase, "trying" ) && backend_lock != -1 && i < 2);
++            }
++            fclose( file );
++        }
++        if (!forced && d3d12 && index) index = 2; /* No DXMT/DXVK D3D12 implementation. */
++    }
++selected:
++    if (index == 0) dir = getenv( "NECTARINE_D3DMETAL_DIR" );
++    if (index == 0 && (!dir || access( dir, R_OK | X_OK ))) index = d3d12 ? 2 : 1;
++    if (index == 1) dir = getenv( "NECTARINE_DXMT_DIR" );
++    if (index == 1 && (!dir || access( dir, R_OK | X_OK ))) index = 2;
++    if (index < 2) graphics_dll_dir = strdup( dir );
++    setenv( "CX_ACTIVE_GRAPHICS_BACKEND", d3d12 && index == 2 ? "vkd3d" : names[index], 1 );
++    if (backend_lock != -1)
++    {
++        snprintf( owner, sizeof(owner), "%ld", (long)getpid() );
++        setenv( "_NECTARINE_BACKEND_STATE", path, 1 );
++        setenv( "_NECTARINE_BACKEND_OWNER", owner, 1 );
++    }
++    if (getenv( "NECTARINE_GRAPHICS_TRACE" ))
++        fprintf( stderr, "wine: graphics=%s forced=%d tracking=%d state=%s image=%s\n",
++                 getenv( "CX_ACTIVE_GRAPHICS_BACKEND" ), !!forced, backend_lock != -1,
++                 path[0] ? path : "none", image );
++    return TRUE;
++}
++
+ /* NECTARINE_D3D12=auto: one engine/prefix for everything. Each process picks its D3D backend
+  * from its own image: D3D12 importers get Apple's D3DMetal (its DLL directory searched first),
+  * everything else keeps the default (DXVK). Decided before anything reads the backend. */
+@@ -2970,25 +3108,58 @@ static void select_graphics_backend( int argc, char *argv[] )
+ {
+     const char *mode = getenv( "NECTARINE_D3D12" ), *dir = getenv( "NECTARINE_D3DMETAL_DIR" );
+     const char *image = getenv( "WINE_NECTARINE_IMAGE" );
+-    BOOL d3dmetal;
++    const char *d3d11 = getenv( "NECTARINE_D3D11" );
++    BOOL d3dmetal, force_d3d11 = FALSE, force_d3d12 = FALSE;
+     int i;
+ 
++    if (!image && argc > 1) image = argv[1];
++    if (select_fallback_backend( argc, argv, image )) return;
++
++    if (d3d11 && strcmp( d3d11, "dxmt" ) && strcmp( d3d11, "dxvk" ) &&
++        strcmp( d3d11, "d3dmetal" )) d3d11 = NULL;
++
+     /* "auto": D3DMetal for D3D12 games; "always": for every process (D3DMetal also does D3D10/11) */
+     if (!mode || (strcmp( mode, "auto" ) && strcmp( mode, "always" )) || !dir || !*dir) return;
+     if (!image && argc > 1) image = argv[1];  /* first process: unix path, relative to cwd */
+-    /* "always": every 64-bit game process (D3DMetal has no 32-bit side) except Steam's own client
+-     * processes, whose CEF UI is known to work on the default path. */
+-    d3dmetal = (!strcmp( mode, "always" ) && image && pe_is_x86_64( image ) && !strcasestr( image, "/steam/bin/" ) &&
+-                !strcasestr( image, "steamwebhelper" ) && !strcasestr( image, "/steam.exe" )) ||
++    d3dmetal = (!strcmp( mode, "always" ) && image && pe_is_x86_64( image ) &&
++                !strcasestr( image, "/steam/bin/" ) && !strcasestr( image, "steamwebhelper" ) &&
++                !strcasestr( image, "/steam.exe" )) ||
+                (image && (pe_imports_d3d12( image ) || ships_d3d12_runtime( image )));
+     /* Games that load D3D12 at runtime (Unreal, Unity) don't import it; the standard -dx12 /
+      * -d3d12 switch (e.g. Steam launch options) asks for D3D12, and thus D3DMetal, explicitly. */
+-    for (i = 1; !d3dmetal && i < argc; i++)
+-        if (!strcasecmp( argv[i], "-dx12" ) || !strcasecmp( argv[i], "-d3d12" )) d3dmetal = TRUE;
++    for (i = 1; i < argc; i++)
++    {
++        if (!strcasecmp( argv[i], "-dx12" ) || !strcasecmp( argv[i], "-d3d12" ) ||
++            !strcasecmp( argv[i], "-force-d3d12" )) force_d3d12 = TRUE;
++        if (!strcasecmp( argv[i], "-dx11" ) || !strcasecmp( argv[i], "-d3d11" ) ||
++            !strcasecmp( argv[i], "-force-d3d11" )) force_d3d11 = TRUE;
++    }
++    /* An explicit D3D11 RHI permits testing even an Agility-capable game. Keep the
++     * existing heuristic when no D3D11 override is requested. D3D12 always wins. */
++    if (force_d3d12) d3dmetal = TRUE;
++    else if (d3d11 && force_d3d11 && strcmp( mode, "always" )) d3dmetal = FALSE;
++    if (!d3dmetal && d3d11)
++    {
++        if (!strcmp( d3d11, "dxmt" ))
++        {
++            const char *dxmt_dir = getenv( "NECTARINE_DXMT_DIR" );
++            if (dxmt_dir && *dxmt_dir && !access( dxmt_dir, R_OK | X_OK ))
++            {
++                if (getenv( "NECTARINE_GRAPHICS_TRACE" ))
++                    fprintf( stderr, "wine: graphics=dxmt dir=%s image=%s\n", dxmt_dir, image ? image : "" );
++                graphics_dll_dir = strdup( dxmt_dir );
++                setenv( "CX_ACTIVE_GRAPHICS_BACKEND", "dxmt", 1 );
++                return;
++            }
++            fprintf( stderr, "wine: DXMT directory unavailable; using default backend\n" );
++        }
++        else if (!strcmp( d3d11, "d3dmetal" )) d3dmetal = TRUE;
++        /* dxvk and unknown values retain the engine's default DXVK DLLs. */
++    }
+     if (d3dmetal)
+     {
+         setenv( "CX_ACTIVE_GRAPHICS_BACKEND", "d3dmetal", 1 );
+-        d3dmetal_dll_dir = strdup( dir );
++        graphics_dll_dir = strdup( dir );
+     }
+     else
+     {
+@@ -2996,6 +3167,9 @@ static void select_graphics_backend( int argc, char *argv[] )
+         if (def && *def) setenv( "CX_ACTIVE_GRAPHICS_BACKEND", def, 1 );
+         else unsetenv( "CX_ACTIVE_GRAPHICS_BACKEND" );
+     }
++    if (getenv( "NECTARINE_GRAPHICS_TRACE" ))
++        fprintf( stderr, "wine: graphics=%s dir=%s image=%s\n", d3dmetal ? "d3dmetal" : "dxvk",
++                 graphics_dll_dir ? graphics_dll_dir : "default", image ? image : "" );
+     /* WINE_NECTARINE_IMAGE is kept: the loader may re-exec itself and must decide the same way;
+      * spawn_process() overwrites it for every child. */
+ }
+@@ -3026,6 +3200,9 @@ DECLSPEC_EXPORT void __wine_main( int argc, char *argv[] )
+     init_paths();
+     if (!getenv( "WINELOADERNOEXEC" ) || argc <= 1) check_command_line( argc, argv );
+     unsetenv( "WINELOADERNOEXEC" );
++#if defined(__APPLE__) && defined(__x86_64__)
++    nectarine_backend_write( "trying" );
++#endif
+ 
+ #ifdef RLIMIT_NOFILE
+     set_max_limit( RLIMIT_NOFILE );
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index bb0b147b29e..aaffc1f00aa 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -23,6 +23,9 @@
+ #endif
+ 
+ #include "config.h"
++#if defined(__APPLE__) && defined(__x86_64__)
++#include "wine/nectarine_backend.h"
++#endif
+ 
+ #include <assert.h>
+ #include <errno.h>
+@@ -1552,6 +1555,9 @@ static DECLSPEC_NORETURN void exit_thread( int status )
+  */
+ void exit_process( int status )
+ {
++#if defined(__APPLE__) && defined(__x86_64__)
++    if (!status) nectarine_backend_write( "good" );
++#endif
+     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
+     process_exit_wrapper( get_unix_exit_code( status ));
+ }
+diff --git a/dlls/winemac.drv/d3dmetal_objc.m b/dlls/winemac.drv/d3dmetal_objc.m
+index 90c1dc9be96..71da5c6b75e 100644
+--- a/dlls/winemac.drv/d3dmetal_objc.m
++++ b/dlls/winemac.drv/d3dmetal_objc.m
+@@ -27,6 +27,9 @@
+ #import <objc/runtime.h>
+ 
+ #include "macdrv_cocoa.h"
++#include "wine/nectarine_backend.h"
++#include <pthread.h>
++#include <time.h>
+ #import "cocoa_app.h"
+ #import "cocoa_event.h"
+ #import "cocoa_window.h"
+@@ -35,6 +38,39 @@
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
+ 
++/* Observe actual drawable presentation, never allocation or command submission.
++ * Install on the base class so the same health signal covers all three backends.
++ * A PID check prevents inherited state from marking the launching process good. */
++__attribute__((constructor)) static void nectarine_install_present_health(void)
++{
++    const char *owner = getenv( "_NECTARINE_BACKEND_OWNER" );
++    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
++    static unsigned int frames;
++    static double first;
++    static int good;
++    if (!owner || strtol( owner, NULL, 10 ) != getpid()) return;
++    SEL sel = @selector(nextDrawable);
++    Method method = class_getInstanceMethod( [CAMetalLayer class], sel );
++    IMP original = method_getImplementation( method );
++    method_setImplementation( method, imp_implementationWithBlock(^id(CAMetalLayer *layer) {
++        id<CAMetalDrawable> drawable = ((id (*)(id, SEL))original)(layer, sel);
++        pthread_mutex_lock( &mutex );
++        int observe = !good;
++        pthread_mutex_unlock( &mutex );
++        if (drawable && observe) [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
++            struct timespec ts;
++            clock_gettime( CLOCK_MONOTONIC, &ts );
++            double now = ts.tv_sec + ts.tv_nsec / 1e9;
++            pthread_mutex_lock( &mutex );
++            if (!frames++) first = now;
++            if (!good && frames >= 120 && now - first >= 20.0)
++                good = nectarine_backend_write( "good" );
++            pthread_mutex_unlock( &mutex );
++        }];
++        return drawable;
++    }));
++}
++
+ @implementation WineMetalLayer
+ 
+     /* Extend [CAMetalLayer nextDrawable] so client_surface_present() can be
+diff --git a/dlls/winemac.drv/macdrv_main.c b/dlls/winemac.drv/macdrv_main.c
+index 814f99b9489..94cb5c3f110 100644
+--- a/dlls/winemac.drv/macdrv_main.c
++++ b/dlls/winemac.drv/macdrv_main.c
+@@ -435,7 +435,9 @@ static NTSTATUS macdrv_init(void *arg)
+ #if defined(__APPLE__) && defined(__x86_64__)
+     const char *backend = getenv("CX_ACTIVE_GRAPHICS_BACKEND");
+ 
+-    d3dmetal_enabled = backend && !strcmp(backend, "d3dmetal");
++    /* DXMT consumes the same exported Metal-view/client-surface bridge.
++     * This flag does not select Apple libraries or ntdll's GS-base mode. */
++    d3dmetal_enabled = backend && (!strcmp(backend, "d3dmetal") || !strcmp(backend, "dxmt"));
+ #endif
+ 
+     app_icon_callback = params->app_icon_callback;
+diff --git a/include/Makefile.in b/include/Makefile.in
+index ea6abbda2fb..0a6ef59c8fa 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -965,6 +965,7 @@ SOURCES = \
+ 	wine/condrv.h \
+ 	wine/dcetypes.idl \
+ 	wine/debug.h \
++	wine/nectarine_backend.h \
+ 	wine/dplaysp.h \
+ 	wine/epm.idl \
+ 	wine/exception.h \
+diff --git a/include/wine/nectarine_backend.h b/include/wine/nectarine_backend.h
+new file mode 100644
+index 00000000000..2a15782f7fa
+--- /dev/null
++++ b/include/wine/nectarine_backend.h
+@@ -0,0 +1,34 @@
++/* Nectarine backend state shared by ntdll and the native presentation callback.
++ * Internal environment values are PID-scoped; children must never mark a parent good.
++ * The selector holds a separate flock for the process lifetime. Atomic rename keeps
++ * readers from observing partial records. SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#ifndef __WINE_NECTARINE_BACKEND_H
++#define __WINE_NECTARINE_BACKEND_H
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++
++static inline int nectarine_backend_write( const char *phase )
++{
++    const char *path = getenv( "_NECTARINE_BACKEND_STATE" );
++    const char *owner = getenv( "_NECTARINE_BACKEND_OWNER" );
++    const char *backend = getenv( "CX_ACTIVE_GRAPHICS_BACKEND" );
++    char tmp[4096], record[128];
++    int fd, len, ok;
++    if (!path || !owner || !backend || strtol( owner, NULL, 10 ) != getpid()) return 0;
++    if (snprintf( tmp, sizeof(tmp), "%s.XXXXXX", path ) >= (int)sizeof(tmp)) return 0;
++    if ((fd = mkstemp( tmp )) == -1) return 0;
++    len = snprintf( record, sizeof(record), "%s %s pid=%s\n", phase, backend, owner );
++    ok = write( fd, record, len ) == len;
++    if (ok) ok = !fsync( fd );
++    if (close( fd )) ok = 0;
++    if (ok) ok = !rename( tmp, path );
++    if (!ok) unlink( tmp );
++    if (ok && getenv( "NECTARINE_GRAPHICS_TRACE" ))
++        fprintf( stderr, "wine: backend-state=%s %s state=%s\n", phase, backend, path );
++    return ok;
++}
++#endif

@@ -1,0 +1,30 @@
+From 3cbef50b4927e80754857dcd767bdb06213886a3 Mon Sep 17 00:00:00 2001
+From: Alexandre Julliard <julliard@winehq.org>
+Date: Wed, 2 Sep 2026 11:04:48 +0200
+Subject: [PATCH 22/29] ntdll: Fix mmap_is_in_reserved_area when area starts in
+ the middle of the specified range.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60275
+---
+ dlls/ntdll/unix/virtual.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 28bc063c222..1e4833b5bd9 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -686,9 +686,10 @@ static int mmap_is_in_reserved_area( void *addr, SIZE_T size )
+ 
+     LIST_FOR_EACH_ENTRY( area, &reserved_areas, struct reserved_area, entry )
+     {
+-        if (area->base > addr) break;
++        if ((char *)area->base > (char *)addr + size) break;
+         if ((char *)area->base + area->size <= (char *)addr) continue;
+         /* area must contain block completely */
++        if (area->base > addr) return -1;
+         if ((char *)area->base + area->size < (char *)addr + size) return -1;
+         return 1;
+     }
+-- 
+2.43.0
+

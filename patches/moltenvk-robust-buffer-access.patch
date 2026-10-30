@@ -1,0 +1,37 @@
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -2089,6 +2089,7 @@
+     shaderConfig.options.mslOptions.texel_buffer_texture_width = mtlFeats.maxTextureDimension;
+     shaderConfig.options.mslOptions.r32ui_linear_texture_alignment = (uint32_t)_device->getVkFormatTexelBufferAlignment(VK_FORMAT_R32_UINT, this);
+     shaderConfig.options.mslOptions.swizzle_texture_samples = !mtlFeats.nativeTextureSwizzle;
++	shaderConfig.options.mslOptions.robust_buffer_access = getEnabledFeatures().robustBufferAccess;
+ 	shaderConfig.options.mslOptions.texture_buffer_native = true;
+ 
+ 	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
+@@ -2557,6 +2558,7 @@
+     shaderConfig.options.mslOptions.texel_buffer_texture_width = mtlFeats.maxTextureDimension;
+     shaderConfig.options.mslOptions.r32ui_linear_texture_alignment = (uint32_t)_device->getVkFormatTexelBufferAlignment(VK_FORMAT_R32_UINT, this);
+     shaderConfig.options.mslOptions.swizzle_texture_samples = !mtlFeats.nativeTextureSwizzle;
++	shaderConfig.options.mslOptions.robust_buffer_access = getEnabledFeatures().robustBufferAccess;
+ 	shaderConfig.options.mslOptions.texture_buffer_native = true;
+ 	shaderConfig.options.mslOptions.dispatch_base = _allowsDispatchBase;
+ 	shaderConfig.options.mslOptions.texture_1D_as_2D = mvkCfg.texture1DAs2D;
+@@ -2967,7 +2969,8 @@
+ 				opt.force_fragment_with_side_effects_execution,
+ 				opt.input_attachment_is_ds_attachment,
+ 				opt.auto_disable_rasterization,
+-				opt.use_fast_math_pragmas);
++				opt.use_fast_math_pragmas,
++				opt.robust_buffer_access);
+ 	}
+ 
+ 	template<class Archive>
+@@ -3247,7 +3250,7 @@
+ 
+ void mvkValidateCeralArchiveDefinitions() {
+ 	[[maybe_unused]] size_t missingBytes = 0;
+-	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(7);
++	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(6);
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable>();
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLResourceBinding>();
+ 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLConstexprSampler>();

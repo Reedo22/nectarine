@@ -1,0 +1,388 @@
+From 2f1c952abc8f7c375cc54f7c9901e341867acda3 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 14:00:33 -0400
+Subject: [PATCH 14/29] ntdll, server: Give macOS multi-object waits private
+ wake words.
+
+All multi-address waiters shared one wake generation, so every wake of a watched
+object woke every alertable or multi-object waiter in the prefix (Wine services
+included). Each such wait now takes a wake word from a slot bitmap in reserved
+shm and registers it in the bucket lists of its addresses; wakers wake only the
+registered words. A full bucket list falls back to the shared generation.
+The shared bookkeeping moves to include/wine/fsync_mac.h.
+---
+ dlls/ntdll/unix/fsync.c  |  83 +++++++++++----------
+ include/wine/fsync_mac.h | 152 +++++++++++++++++++++++++++++++++++++++
+ server/fsync.c           |  35 ++-------
+ 3 files changed, 199 insertions(+), 71 deletions(-)
+ create mode 100644 include/wine/fsync_mac.h
+
+diff --git a/dlls/ntdll/unix/fsync.c b/dlls/ntdll/unix/fsync.c
+index 0758b87e31c..be1f261b4ec 100644
+--- a/dlls/ntdll/unix/fsync.c
++++ b/dlls/ntdll/unix/fsync.c
+@@ -47,6 +47,7 @@
+ #ifdef __APPLE__
+ # include <os/clock.h>
+ # include <os/os_sync_wait_on_address.h>
++# include "wine/fsync_mac.h"
+ #endif
+ 
+ #include "ntstatus.h"
+@@ -144,24 +145,8 @@ static void simulate_sched_quantum(void)
+ 
+ #ifdef __APPLE__
+ 
+-/* macOS has no futex_waitv. A wait on one address uses os_sync_wait_on_address (a
+- * cross-process futex on shared mappings). A wait on several addresses sleeps on a shared
+- * wake generation that wakers bump when someone watches their address. Callers re-check
+- * object state after any wake, so a wake meant for someone else only costs a loop. */
+-/* Shared wait bookkeeping at the start of the fsync shm (indices below
+- * FSYNC_MAC_RESERVED_IDX are never handed out by the server):
+- *   base[0]                    wake generation for multi-address waiters
+- *   base[4 .. 4+1024)          sleepers on a single address, bucketed by address
+- *   base[4+1024 .. 4+2048)     multi-address waiters watching an address, same buckets
+- * Buckets use the offset within a 4 KiB page, which is the same in every process mapping
+- * the shm. Wakers only enter the kernel when the matching bucket is non-zero; collisions
+- * merely cost a redundant wake. */
+-#define MAC_SYNC_BUCKETS 1024
+-#define MAC_BUCKET(addr) ((((uintptr_t)(addr)) & 0xfff) >> 2)
+-static int *mac_sync_base;
+-#define MAC_GEN              (&mac_sync_base[0])
+-#define MAC_SLEEPERS(addr)   (&mac_sync_base[4 + MAC_BUCKET(addr)])
+-#define MAC_WATCHERS(addr)   (&mac_sync_base[4 + MAC_SYNC_BUCKETS + MAC_BUCKET(addr)])
++/* See wine/fsync_mac.h for the wait bookkeeping shared with the server. */
++static struct mac_sync_shm *mac_sync;
+ 
+ static int mac_wait_on_address( int *addr, int val, const struct timespec64 *end, clockid_t clock_id )
+ {
+@@ -198,12 +183,9 @@ static int mac_first_changed( const struct futex_waitv *futexes, int count )
+     return -1;
+ }
+ 
+-static void mac_watch( const struct futex_waitv *futexes, int count, int delta )
++static inline unsigned int futex_bucket( const struct futex_waitv *futex )
+ {
+-    int i;
+-
+-    for (i = 0; i < count; i++)
+-        __atomic_add_fetch( MAC_WATCHERS(u64_to_ptr(futexes[i].uaddr)), delta, __ATOMIC_SEQ_CST );
++    return mac_sync_bucket( u64_to_ptr(futex->uaddr) );
+ }
+ 
+ /* Same contract as futex_waitv: -1/EAGAIN if a value already differs, -1/ETIMEDOUT on
+@@ -211,24 +193,50 @@ static void mac_watch( const struct futex_waitv *futexes, int count, int delta )
+ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+         int count, const struct timespec64 *end, clockid_t clock_id )
+ {
+-    int ret, gen;
++    int ret, i, slot = -1, added = 0;
+ 
+     if (count == 1)
+     {
+         int *addr = u64_to_ptr(futexes[0].uaddr);
++        int *sleepers = &mac_sync->sleepers[mac_sync_bucket( addr )];
+ 
+-        __atomic_add_fetch( MAC_SLEEPERS(addr), 1, __ATOMIC_SEQ_CST );
++        __atomic_add_fetch( sleepers, 1, __ATOMIC_SEQ_CST );
+         if (mac_first_changed( futexes, 1 ) == 0) ret = 0;
+         else ret = mac_wait_on_address( addr, futexes[0].val, end, clock_id );
+-        __atomic_sub_fetch( MAC_SLEEPERS(addr), 1, __ATOMIC_SEQ_CST );
++        __atomic_sub_fetch( sleepers, 1, __ATOMIC_SEQ_CST );
+     }
+     else
+     {
+-        mac_watch( futexes, count, 1 );
+-        gen = __atomic_load_n( MAC_GEN, __ATOMIC_SEQ_CST );
+-        if (mac_first_changed( futexes, count ) >= 0) ret = 0;
+-        else ret = mac_wait_on_address( MAC_GEN, gen, end, clock_id );
+-        mac_watch( futexes, count, -1 );
++        /* Sleep on a private wake word that wakers of any watched address set. */
++        if ((slot = mac_sync_alloc_slot( mac_sync, GetCurrentThreadId() )) >= 0)
++        {
++            __atomic_store_n( &mac_sync->words[slot], 0, __ATOMIC_SEQ_CST );
++            for (added = 0; added < count; added++)
++                if (!mac_sync_list_add( mac_sync, futex_bucket( &futexes[added] ), slot + 1 )) break;
++        }
++        if (slot >= 0 && added == count)
++        {
++            if (mac_first_changed( futexes, count ) >= 0) ret = 0;
++            else ret = mac_wait_on_address( &mac_sync->words[slot], 0, end, clock_id );
++        }
++        else
++        {
++            /* No free slot or a full bucket list: use the shared wake generation. */
++            int gen;
++
++            for (i = 0; i < count; i++)
++                __atomic_add_fetch( &mac_sync->overflow[futex_bucket( &futexes[i] )], 1, __ATOMIC_SEQ_CST );
++            gen = __atomic_load_n( &mac_sync->gen, __ATOMIC_SEQ_CST );
++            if (mac_first_changed( futexes, count ) >= 0) ret = 0;
++            else ret = mac_wait_on_address( &mac_sync->gen, gen, end, clock_id );
++            for (i = 0; i < count; i++)
++                __atomic_sub_fetch( &mac_sync->overflow[futex_bucket( &futexes[i] )], 1, __ATOMIC_SEQ_CST );
++        }
++        if (slot >= 0)
++        {
++            for (i = 0; i < added; i++) mac_sync_list_remove( mac_sync, futex_bucket( &futexes[i] ), slot + 1 );
++            mac_sync_free_slot( mac_sync, slot );
++        }
+     }
+     if (ret < 0 && errno == ETIMEDOUT) return -1;
+     if ((ret = mac_first_changed( futexes, count )) >= 0) return ret;
+@@ -252,16 +260,7 @@ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+ static inline int futex_wake( int *addr, int val )
+ {
+ #ifdef __APPLE__
+-    /* Pairs with the counter increments in the waiters: either they see our store, or we
+-     * see their counter. */
+-    __atomic_thread_fence( __ATOMIC_SEQ_CST );
+-    if (__atomic_load_n( MAC_SLEEPERS(addr), __ATOMIC_SEQ_CST ))
+-        os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+-    if (__atomic_load_n( MAC_WATCHERS(addr), __ATOMIC_SEQ_CST ))
+-    {
+-        __atomic_add_fetch( MAC_GEN, 1, __ATOMIC_SEQ_CST );
+-        os_sync_wake_by_address_all( MAC_GEN, sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+-    }
++    mac_sync_wake( mac_sync, addr );
+     return 0;
+ #else
+     return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
+@@ -604,7 +603,7 @@ void fsync_init( DWORD pid )
+     current_pid = pid;
+     assert( current_pid );
+ #ifdef __APPLE__
+-    mac_sync_base = get_shm( 0 );
++    mac_sync = get_shm( 0 );
+ #endif
+ }
+ 
+diff --git a/include/wine/fsync_mac.h b/include/wine/fsync_mac.h
+new file mode 100644
+index 00000000000..dc3a45c4a78
+--- /dev/null
++++ b/include/wine/fsync_mac.h
+@@ -0,0 +1,152 @@
++/*
++ * macOS wait/wake layer for the fsync in-process sync backend
++ *
++ * Copyright 2026 Nectarine contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_FSYNC_MAC_H
++#define __WINE_FSYNC_MAC_H
++
++#ifdef __APPLE__
++
++#include <stdint.h>
++#include <os/os_sync_wait_on_address.h>
++
++/* macOS has os_sync_wait_on_address (a futex that works across processes on shared
++ * mappings, 14.4+) but nothing like futex_waitv. Both the clients and the server keep
++ * this bookkeeping at the start of the fsync shm, which the server never hands out:
++ *
++ *   gen                 wake generation, fallback for multi-address waits
++ *   sleepers[b]         threads sleeping directly on an address in bucket b
++ *   overflow[b]         fallback multi-address waiters watching bucket b
++ *   slot_map            allocation bitmap for per-wait wake words
++ *   words[s]            wake word of multi-address wait s (0 = sleeping, 1 = woken)
++ *   lists[b][k]         s + 1 for multi-address waits watching bucket b, 0 = empty
++ *
++ * Buckets are keyed by the offset within a 4 KiB page, which is the same in every process
++ * that maps the shm (even with Rosetta's 4 KiB pages). Wakers only enter the kernel for
++ * buckets that have someone in them; collisions just cost a redundant wake, and every
++ * waiter re-checks its objects after waking.
++ *
++ * Ordering: a waker stores the new value, then (full fence) reads the bucket; a waiter
++ * registers in the bucket with a full-barrier atomic, then reads the value (or lets the
++ * kernel compare it). So either the waiter sees the new value or the waker sees it. */
++
++#define MAC_SYNC_BUCKETS    1024
++#define MAC_SYNC_LIST_LEN   8
++#define MAC_SYNC_SLOTS      4096
++
++struct mac_sync_shm
++{
++    int      gen;
++    int      pad[3];
++    int      sleepers[MAC_SYNC_BUCKETS];
++    int      overflow[MAC_SYNC_BUCKETS];
++    uint64_t slot_map[MAC_SYNC_SLOTS / 64];
++    int      words[MAC_SYNC_SLOTS];
++    int      lists[MAC_SYNC_BUCKETS][MAC_SYNC_LIST_LEN];
++};
++
++/* first fsync shm index (16 bytes each) not covered by struct mac_sync_shm */
++#define MAC_SYNC_RESERVED_IDX ((sizeof(struct mac_sync_shm) + 15) / 16)
++
++static inline unsigned int mac_sync_bucket( const void *addr )
++{
++    return (((uintptr_t)addr) & 0xfff) >> 2;
++}
++
++static inline void mac_sync_wake_addr( int *addr )
++{
++    os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
++}
++
++/* Wake everything waiting for *addr to change. Call after storing the new value. */
++static inline void mac_sync_wake( struct mac_sync_shm *shm, int *addr )
++{
++    unsigned int b = mac_sync_bucket( addr ), k;
++
++    __atomic_thread_fence( __ATOMIC_SEQ_CST );
++    if (__atomic_load_n( &shm->sleepers[b], __ATOMIC_SEQ_CST )) mac_sync_wake_addr( addr );
++    for (k = 0; k < MAC_SYNC_LIST_LEN; k++)
++    {
++        int entry = __atomic_load_n( &shm->lists[b][k], __ATOMIC_SEQ_CST );
++        if (!entry) continue;
++        __atomic_store_n( &shm->words[entry - 1], 1, __ATOMIC_SEQ_CST );
++        mac_sync_wake_addr( &shm->words[entry - 1] );
++    }
++    if (__atomic_load_n( &shm->overflow[b], __ATOMIC_SEQ_CST ))
++    {
++        __atomic_add_fetch( &shm->gen, 1, __ATOMIC_SEQ_CST );
++        mac_sync_wake_addr( &shm->gen );
++    }
++}
++
++static inline int mac_sync_alloc_slot( struct mac_sync_shm *shm, unsigned int hint )
++{
++    unsigned int i, w;
++
++    for (i = 0; i < MAC_SYNC_SLOTS / 64; i++)
++    {
++        uint64_t *word = &shm->slot_map[w = (hint + i) % (MAC_SYNC_SLOTS / 64)];
++        uint64_t cur = __atomic_load_n( word, __ATOMIC_SEQ_CST );
++
++        while (~cur)
++        {
++            unsigned int bit = __builtin_ctzll( ~cur );
++            if (__atomic_compare_exchange_n( word, &cur, cur | ((uint64_t)1 << bit), 0,
++                                             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
++                return w * 64 + bit;
++        }
++    }
++    return -1;
++}
++
++static inline void mac_sync_free_slot( struct mac_sync_shm *shm, int slot )
++{
++    __atomic_and_fetch( &shm->slot_map[slot / 64], ~((uint64_t)1 << (slot % 64)), __ATOMIC_SEQ_CST );
++}
++
++static inline int mac_sync_list_add( struct mac_sync_shm *shm, unsigned int b, int entry )
++{
++    unsigned int k;
++
++    for (k = 0; k < MAC_SYNC_LIST_LEN; k++)
++    {
++        int empty = 0;
++        if (__atomic_compare_exchange_n( &shm->lists[b][k], &empty, entry, 0,
++                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
++            return 1;
++    }
++    return 0;
++}
++
++static inline void mac_sync_list_remove( struct mac_sync_shm *shm, unsigned int b, int entry )
++{
++    unsigned int k;
++
++    for (k = 0; k < MAC_SYNC_LIST_LEN; k++)
++    {
++        int expected = entry;
++        if (__atomic_compare_exchange_n( &shm->lists[b][k], &expected, 0, 0,
++                                         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ))
++            return;
++    }
++}
++
++#endif /* __APPLE__ */
++
++#endif /* __WINE_FSYNC_MAC_H */
+diff --git a/server/fsync.c b/server/fsync.c
+index bbd7f943362..39e07e213df 100644
+--- a/server/fsync.c
++++ b/server/fsync.c
+@@ -37,6 +37,7 @@
+ #include <unistd.h>
+ #ifdef __APPLE__
+ # include <os/os_sync_wait_on_address.h>
++# include "wine/fsync_mac.h"
+ #endif
+ 
+ #include "ntstatus.h"
+@@ -84,22 +85,7 @@ static int is_fsync_initialized;
+ /* XNU only allows ftruncate() once on a POSIX shm object, so size it up front; pages
+  * are only backed once touched. Same limit as msync. */
+ #define FSYNC_MAC_SHM_SIZE (0x100000 * 16)
+-/* Shared wait bookkeeping at the start of the fsync shm (indices below
+- * FSYNC_MAC_RESERVED_IDX are never handed out by the server):
+- *   base[0]                    wake generation for multi-address waiters
+- *   base[4 .. 4+1024)          sleepers on a single address, bucketed by address
+- *   base[4+1024 .. 4+2048)     multi-address waiters watching an address, same buckets
+- * Buckets use the offset within a 4 KiB page, which is the same in every process mapping
+- * the shm. Wakers only enter the kernel when the matching bucket is non-zero; collisions
+- * merely cost a redundant wake. */
+-#define MAC_SYNC_BUCKETS 1024
+-#define MAC_BUCKET(addr) ((((uintptr_t)(addr)) & 0xfff) >> 2)
+-static int *mac_sync_base;
+-/* first shm index not used by the table above */
+-#define FSYNC_MAC_RESERVED_IDX (1 + 2 * MAC_SYNC_BUCKETS * sizeof(int) / 16)
+-#define MAC_GEN              (&mac_sync_base[0])
+-#define MAC_SLEEPERS(addr)   (&mac_sync_base[4 + MAC_BUCKET(addr)])
+-#define MAC_WATCHERS(addr)   (&mac_sync_base[4 + MAC_SYNC_BUCKETS + MAC_BUCKET(addr)])
++static struct mac_sync_shm *mac_sync;
+ #endif
+ 
+ static uint64_t *shm_idx_free_map;
+@@ -157,9 +143,9 @@ void fsync_init(void)
+     {
+         unsigned int i;
+ 
+-        for (i = 0; i < FSYNC_MAC_RESERVED_IDX; i++)
++        for (i = 0; i < MAC_SYNC_RESERVED_IDX; i++)
+             shm_idx_free_map[i / BITS_IN_FREE_MAP_WORD] &= ~((uint64_t)1 << (i % BITS_IN_FREE_MAP_WORD));
+-        shm_idx_free_search_start_hint = FSYNC_MAC_RESERVED_IDX / BITS_IN_FREE_MAP_WORD;
++        shm_idx_free_search_start_hint = MAC_SYNC_RESERVED_IDX / BITS_IN_FREE_MAP_WORD;
+     }
+ #endif
+ 
+@@ -358,17 +344,8 @@ int fsync_grab_shm_idx( unsigned int shm_idx )
+ static inline int futex_wake( int *addr, int val )
+ {
+ #ifdef __APPLE__
+-    if (!mac_sync_base) mac_sync_base = get_shm( 0 );
+-    /* Pairs with the counter increments in the waiters: either they see our store, or we
+-     * see their counter. */
+-    __atomic_thread_fence( __ATOMIC_SEQ_CST );
+-    if (__atomic_load_n( MAC_SLEEPERS(addr), __ATOMIC_SEQ_CST ))
+-        os_sync_wake_by_address_all( addr, sizeof(*addr), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+-    if (__atomic_load_n( MAC_WATCHERS(addr), __ATOMIC_SEQ_CST ))
+-    {
+-        __atomic_add_fetch( MAC_GEN, 1, __ATOMIC_SEQ_CST );
+-        os_sync_wake_by_address_all( MAC_GEN, sizeof(int), OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+-    }
++    if (!mac_sync) mac_sync = get_shm( 0 );
++    mac_sync_wake( mac_sync, addr );
+     return 0;
+ #else
+     return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
+-- 
+2.43.0
+

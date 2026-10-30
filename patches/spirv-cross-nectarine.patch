@@ -1,0 +1,252 @@
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index c5a9d433..f147bc0a 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include "spirv_msl.hpp"
++#include <cstdlib>
+ #include "GLSL.std.450.h"
+ 
+ #include <algorithm>
+@@ -1852,6 +1853,7 @@ string CompilerMSL::compile()
+ 		next_metal_resource_index_buffer = 0;
+ 		next_metal_resource_index_texture = 0;
+ 		next_metal_resource_index_sampler = 0;
++		collect_claimed_msl_resource_indices();
+ 		for (auto &id : next_metal_resource_ids)
+ 			id = 0;
+ 
+@@ -4723,6 +4725,99 @@ uint32_t CompilerMSL::add_interface_block(StorageClass storage, bool patch)
+ 		}
+ 	}
+ 
++	if (!capture_output_to_buffer && storage == StorageClassOutput && get_execution_model() == ExecutionModelVertex)
++	{
++		// Metal requires every input of the fragment stage to be written by the vertex stage, with a
++		// matching type. Vulkan does not: an input with no matching output in the previous stage just
++		// reads undefined values. So when the app has told us what the next stage reads, via
++		// add_msl_shader_output(), declare a dummy output for each location this shader does not write,
++		// so that the two stage interfaces link.
++		for (auto &output : outputs_by_location)
++		{
++			if (output.second.builtin != BuiltInMax)
++				continue;
++			if (location_outputs_in_use.count(output.first.location) != 0)
++				continue;
++
++			// Create a fake variable to put at the location.
++			uint32_t offset = ir.increase_bound_by(4);
++			uint32_t type_id = offset;
++			uint32_t vec_type_id = offset + 1;
++			uint32_t ptr_type_id = offset + 2;
++			uint32_t var_id = offset + 3;
++
++			SPIRType::BaseType basetype = output.second.basetype;
++			if (basetype == SPIRType::Unknown)
++			{
++				switch (output.second.format)
++				{
++				case MSL_SHADER_VARIABLE_FORMAT_UINT8:
++					basetype = SPIRType::UByte;
++					break;
++				case MSL_SHADER_VARIABLE_FORMAT_UINT16:
++					basetype = SPIRType::UShort;
++					break;
++				case MSL_SHADER_VARIABLE_FORMAT_ANY16:
++					basetype = SPIRType::Half;
++					break;
++				default:
++					basetype = SPIRType::Float;
++					break;
++				}
++			}
++
++			bool is_float = basetype == SPIRType::Half || basetype == SPIRType::Float || basetype == SPIRType::Double;
++			SPIRType type { is_float ? OpTypeFloat : OpTypeInt };
++			type.basetype = basetype;
++			switch (basetype)
++			{
++			case SPIRType::SByte:
++			case SPIRType::UByte:
++				type.width = 8;
++				break;
++			case SPIRType::Short:
++			case SPIRType::UShort:
++			case SPIRType::Half:
++				type.width = 16;
++				break;
++			case SPIRType::Int64:
++			case SPIRType::UInt64:
++			case SPIRType::Double:
++				type.width = 64;
++				break;
++			default:
++				type.width = 32;
++				break;
++			}
++			set<SPIRType>(type_id, type);
++
++			if (output.second.vecsize > 1)
++			{
++				type.op = OpTypeVector;
++				type.vecsize = output.second.vecsize;
++				set<SPIRType>(vec_type_id, type);
++				type_id = vec_type_id;
++			}
++
++			type.op = OpTypePointer;
++			type.pointer = true;
++			type.pointer_depth++;
++			type.parent_type = type_id;
++			type.storage = storage;
++			auto &ptr_type = set<SPIRType>(ptr_type_id, type);
++			ptr_type.self = type_id;
++
++			auto &fake_var = set<SPIRVariable>(var_id, ptr_type_id, storage);
++			set_decoration(var_id, DecorationLocation, output.first.location);
++			if (output.first.component)
++				set_decoration(var_id, DecorationComponent, output.first.component);
++
++			meta.strip_array = false;
++			meta.allow_local_declaration = false;
++			add_variable_to_interface_block(storage, ib_var_ref, ib_type, fake_var, meta);
++		}
++	}
++
+ 	// When multiple variables need to access same location,
+ 	// unroll locations one by one and we will flatten output or input as necessary.
+ 	for (auto &loc : meta.location_meta)
+@@ -4913,6 +5008,63 @@ uint32_t CompilerMSL::ensure_correct_builtin_type(uint32_t type_id, BuiltIn buil
+ // Ensure that the type is compatible with the shader input.
+ // If it is, simply return the given type ID.
+ // Otherwise, create a new type, and return its ID.
++// Record every Metal resource index the app explicitly assigned for this entry point, so that
++// resources the app did not bind can be allocated indices that do not collide with them.
++void CompilerMSL::collect_claimed_msl_resource_indices()
++{
++	claimed_msl_buffer_indices.clear();
++	claimed_msl_texture_indices.clear();
++	claimed_msl_sampler_indices.clear();
++
++	auto model = get_entry_point().model;
++	for (auto &binding : resource_bindings)
++	{
++		if (binding.first.model != model)
++			continue;
++		auto &rb = binding.second.first;
++		switch (rb.basetype)
++		{
++		case SPIRType::Image:
++		case SPIRType::SampledImage:
++			claimed_msl_texture_indices.insert(rb.msl_texture);
++			if (rb.basetype == SPIRType::SampledImage)
++				claimed_msl_sampler_indices.insert(rb.msl_sampler);
++			break;
++		case SPIRType::Sampler:
++			claimed_msl_sampler_indices.insert(rb.msl_sampler);
++			break;
++		default:
++			claimed_msl_buffer_indices.insert(rb.msl_buffer);
++			break;
++		}
++	}
++}
++
++// Return the next index of a resource type that the app has not explicitly claimed, and advance the
++// counter past it. An app is not obliged to describe every resource a shader declares - a pipeline
++// layout may omit a descriptor set, or not list the stage - and without this, such a resource would
++// be handed an index another resource already occupies, which Metal refuses to compile.
++uint32_t CompilerMSL::allocate_unclaimed_msl_resource_index(uint32_t &next_index, uint32_t stride,
++                                                            const std::unordered_set<uint32_t> &claimed)
++{
++	if (!claimed.empty())
++	{
++		for (;;)
++		{
++			bool collides = false;
++			for (uint32_t i = 0; i < stride && !collides; i++)
++				collides = claimed.count(next_index + i) != 0;
++			if (!collides)
++				break;
++			next_index++;
++		}
++	}
++
++	uint32_t index = next_index;
++	next_index += stride;
++	return index;
++}
++
+ uint32_t CompilerMSL::ensure_correct_input_type(uint32_t type_id, uint32_t location, uint32_t component, uint32_t num_components, bool strip_array)
+ {
+ 	auto &type = get<SPIRType>(type_id);
+@@ -11655,7 +11807,12 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop,
+ 
+ 	// Only precise:: preserves NaN in trancendentals (supposedly, cannot find documentation for this).
+ 	const auto drop_nan_inf = FPFastMathModeNotInfMask | FPFastMathModeNotNaNMask;
+-	bool preserve_nan = (get_fp_fast_math_flags_for_op(result_type, id) & drop_nan_inf) != drop_nan_inf;
++	// MVK_X_FAST_TRANSCENDENTALS: HLSL (fxc/dxc default) makes no NaN/Inf-preservation promise
++	// for these ops, so for translated D3D shaders the precise:: overrides only cost the
++	// multi-instruction software sequences Apple GPUs use for them.
++	static const bool mvkx_fast_transcendentals = getenv("MVK_X_FAST_TRANSCENDENTALS") != nullptr;
++	bool preserve_nan = !mvkx_fast_transcendentals &&
++	                    ((get_fp_fast_math_flags_for_op(result_type, id) & drop_nan_inf) != drop_nan_inf);
+ 	const char *preserve_str = preserve_nan ? "precise" : "fast";
+ 
+ 	// TODO: Emit the default behavior to match existing code. Might need to be revisited.
+@@ -16151,16 +16308,16 @@ uint32_t CompilerMSL::get_metal_resource_index(SPIRVariable &var, SPIRType::Base
+ 		switch (basetype)
+ 		{
+ 		case SPIRType::Image:
+-			resource_index = next_metal_resource_index_texture;
+-			next_metal_resource_index_texture += binding_stride;
++			resource_index = allocate_unclaimed_msl_resource_index(next_metal_resource_index_texture, binding_stride,
++			                                                       claimed_msl_texture_indices);
+ 			break;
+ 		case SPIRType::Sampler:
+-			resource_index = next_metal_resource_index_sampler;
+-			next_metal_resource_index_sampler += binding_stride;
++			resource_index = allocate_unclaimed_msl_resource_index(next_metal_resource_index_sampler, binding_stride,
++			                                                       claimed_msl_sampler_indices);
+ 			break;
+ 		default:
+-			resource_index = next_metal_resource_index_buffer;
+-			next_metal_resource_index_buffer += binding_stride;
++			resource_index = allocate_unclaimed_msl_resource_index(next_metal_resource_index_buffer, binding_stride,
++			                                                       claimed_msl_buffer_indices);
+ 			break;
+ 		}
+ 	}
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index de8608f6..6951316f 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -82,6 +82,10 @@ struct MSLShaderInterfaceVariable
+ 	BuiltIn builtin = BuiltInMax;
+ 	uint32_t vecsize = 0;
+ 	MSLShaderVariableRate rate = MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
++	// Base type of the variable in the stage that declares it. Only used when a variable has to be
++	// synthesized because this shader does not declare it, where format is too coarse to pick a type
++	// that will link against the neighbouring stage. Unknown falls back to the format.
++	SPIRType::BaseType basetype = SPIRType::Unknown;
+ };
+ 
+ // Matches the binding index of a MSL resource for a binding within a descriptor set.
+@@ -1251,6 +1255,15 @@ protected:
+ 	uint32_t next_metal_resource_index_buffer = 0;
+ 	uint32_t next_metal_resource_index_texture = 0;
+ 	uint32_t next_metal_resource_index_sampler = 0;
++
++	// Metal resource indices the app assigned through add_msl_resource_binding(), so that a resource
++	// the app did not explicitly bind is never given an index that is already spoken for.
++	std::unordered_set<uint32_t> claimed_msl_buffer_indices;
++	std::unordered_set<uint32_t> claimed_msl_texture_indices;
++	std::unordered_set<uint32_t> claimed_msl_sampler_indices;
++	void collect_claimed_msl_resource_indices();
++	static uint32_t allocate_unclaimed_msl_resource_index(uint32_t &next_index, uint32_t stride,
++	                                                      const std::unordered_set<uint32_t> &claimed);
+ 	// Intentionally uninitialized, works around MSVC 2013 bug.
+ 	uint32_t next_metal_resource_ids[kMaxArgumentBuffers];
+ 

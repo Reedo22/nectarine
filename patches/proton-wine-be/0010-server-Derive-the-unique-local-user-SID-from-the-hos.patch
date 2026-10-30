@@ -1,0 +1,46 @@
+From 796c820483c10d820270e24918562128db0c0d79 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 13:31:49 -0400
+Subject: [PATCH 10/29] server: Derive the unique local user SID from the host
+ UUID on macOS.
+
+Proton seeds it from /etc/machine-id, which macOS does not have.
+---
+ server/token.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/server/token.c b/server/token.c
+index b75a589a834..e4e36086435 100644
+--- a/server/token.c
++++ b/server/token.c
+@@ -220,6 +220,27 @@ void init_user_sid(void)
+     size_t n;
+     FILE *f;
+ 
++#ifdef __APPLE__
++    /* No /etc/machine-id on macOS: use the first 64 bits of the hardware UUID, the
++     * same amount of identity the Linux path takes from machine-id. */
++    {
++        static const struct timespec no_wait = { 0, 0 };
++        unsigned char uuid[16];
++        unsigned int i;
++
++        if (gethostuuid( uuid, &no_wait ))
++        {
++            fprintf( stderr, "Failed to get host UUID, error %s.\n", strerror( errno ));
++            return;
++        }
++        for (id = 0, i = 0; i < 8; i++) id = (id << 8) | uuid[i];
++        local_user_sid.sub_auth[1] = id >> 32;
++        local_user_sid.sub_auth[2] = id & 0xffffffff;
++        local_user_sid.sub_auth[3] = getuid();
++        return;
++    }
++#endif
++
+     f = fopen( "/etc/machine-id", "r" );
+     if (!f)
+     {
+-- 
+2.43.0
+

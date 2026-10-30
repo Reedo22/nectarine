@@ -1,0 +1,88 @@
+From f565d197a0e4d50a8d3bd0d5ddb7ef6391787788 Mon Sep 17 00:00:00 2001
+From: Reedo22 <141674188+Reedo22@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 18:27:31 -0400
+Subject: [PATCH] win32u: Initialize OpenGL context profile from creation
+ attributes.
+
+The profile enum is not valid in legacy contexts. Using the saved creation attributes avoids spurious GL_INVALID_ENUM errors during context and reserved-texture setup.
+---
+ dlls/opengl32/unix_wgl.c |  4 +---
+ dlls/win32u/opengl.c     | 18 +++++++++++++-----
+ 2 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/opengl32/unix_wgl.c b/dlls/opengl32/unix_wgl.c
+index 605b66f..d91e5bc 100644
+--- a/dlls/opengl32/unix_wgl.c
++++ b/dlls/opengl32/unix_wgl.c
+@@ -1566,7 +1566,7 @@ static void make_context_current( TEB *teb, const struct opengl_funcs *funcs, HD
+     DWORD tid = HandleToULong(teb->ClientId.UniqueThread);
+     size_t size = ARRAYSIZE(legacy_extensions) - 1, count = 0;
+     const char *version, *rest = "", **extensions;
+-    int i, j, profile;
++    int i, j;
+ 
+     static const char *disabled, *enabled;
+ 
+@@ -1686,8 +1686,6 @@ static void make_context_current( TEB *teb, const struct opengl_funcs *funcs, HD
+ 
+     if (TRACE_ON(opengl)) for (i = 0; i < count; i++) TRACE( "++ %s\n", extensions[i] );
+ 
+-    funcs->p_glGetIntegerv( GL_CONTEXT_PROFILE_MASK, &profile );
+-    ctx->base.is_core = !!(profile & GL_CONTEXT_CORE_PROFILE_BIT);
+     ctx->base.has_GL_ARB_viewport_array = is_extension_supported( ctx, "GL_ARB_viewport_array" );
+     ctx->base.has_GL_ARB_clip_control = is_extension_supported( ctx, "GL_ARB_clip_control" );
+     ctx->base.has_GL_ATI_fragment_shader = !ctx->base.is_core && is_extension_supported( ctx, "GL_ATI_fragment_shader" );
+diff --git a/dlls/win32u/opengl.c b/dlls/win32u/opengl.c
+index b2c5d5b..e5cf379 100644
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -2361,11 +2361,9 @@ static BOOL context_sync_drawables( struct wgl_context *context, HDC draw_hdc, H
+ 
+         if (!context->share->reserved_textures)
+         {
+-            int profile, i, prev_texture;
++            int i, prev_texture;
+ 
+-            /* context->is_core exists but it may be not initialized yet. */
+-            funcs->p_glGetIntegerv( GL_CONTEXT_PROFILE_MASK, &profile );
+-            if (profile & GL_CONTEXT_CORE_PROFILE_BIT)
++            if (context->is_core)
+             {
+                 /* Binding texture names without allocation is not allowed on core profile,
+                  * so just allocate the reserved textures. */
+@@ -2384,7 +2382,7 @@ static BOOL context_sync_drawables( struct wgl_context *context, HDC draw_hdc, H
+                 }
+                 funcs->p_glBindTexture( GL_TEXTURE_2D, prev_texture );
+             }
+-            TRACE( "reserved textures, profile %#x.\n", profile );
++            TRACE( "reserved textures, core %d.\n", context->is_core );
+             context->share->reserved_textures = TRUE;
+         }
+ 
+@@ -2936,6 +2934,7 @@ static void context_share_release( struct wgl_context *context )
+ static BOOL win32u_wgl_context_reset( struct wgl_context *context, HDC hdc, struct wgl_context *share, const int *attribs )
+ {
+     void *share_private = share ? share->driver_private : NULL;
++    const int *attr;
+     int format;
+ 
+     TRACE( "context %p, hdc %p, share %p, attribs %p\n", context, hdc, share, attribs );
+@@ -2965,6 +2964,15 @@ static BOOL win32u_wgl_context_reset( struct wgl_context *context, HDC hdc, stru
+         else RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
+         return FALSE;
+     }
++    context->is_core = TRUE;
++    for (attr = attribs; attr && *attr; attr += 2)
++    {
++        if (*attr == WGL_CONTEXT_PROFILE_MASK_ARB)
++        {
++            context->is_core = !!(attr[1] & WGL_CONTEXT_CORE_PROFILE_BIT_ARB);
++            break;
++        }
++    }
+     if (!driver_funcs->p_context_create( format, share_private, attribs, &context->driver_private ))
+     {
+         WARN( "Failed to create driver context for context %p\n", context );
+-- 
+2.54.0 (Apple Git-157)
+

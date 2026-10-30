@@ -1,0 +1,22 @@
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -4,6 +4,8 @@
+ #include "d3d11_fence.h"
+ #include "d3d11_texture.h"
+ 
++#include <cstdlib>
++
+ constexpr static uint32_t MinFlushIntervalUs = 750;
+ constexpr static uint32_t IncFlushIntervalUs = 250;
+ constexpr static uint32_t MaxPendingSubmits  = 6;
+@@ -801,7 +803,9 @@
+                      + IncFlushIntervalUs * pending;
+ 
+       // Prevent flushing too often in short intervals.
+-      if (now - m_lastFlush >= std::chrono::microseconds(delay))
++      bool starveFlush = StrongHint && pending <= 1
++                      && getenv("DXVK_X_STARVE_FLUSH") != nullptr;
++      if (starveFlush || now - m_lastFlush >= std::chrono::microseconds(delay))
+         Flush();
+     }
+   }

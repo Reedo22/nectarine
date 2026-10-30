@@ -1,0 +1,153 @@
+From ac2640a48e2553a638a198846df0a04808ff8788 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sat, 24 Oct 2026 17:56:41 -0400
+Subject: [PATCH 24/29] nsiproxy.sys: Get real interface MAC addresses from
+ IOKit on macOS.
+
+macOS returns the placeholder 02:00:00:00:00:00 from sysctl/getifaddrs to processes
+without a privileged app identity (any ad-hoc signed binary). Apps that fingerprint
+the machine by MAC (e.g. Steam binding its saved login) then see a different machine.
+IOKit still reports the real address; use it when the placeholder comes back.
+---
+ dlls/nsiproxy.sys/Makefile.in |  3 +-
+ dlls/nsiproxy.sys/ndis.c      | 12 ++++++
+ dlls/nsiproxy.sys/ndis_mac.c  | 76 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 90 insertions(+), 1 deletion(-)
+ create mode 100644 dlls/nsiproxy.sys/ndis_mac.c
+
+diff --git a/dlls/nsiproxy.sys/Makefile.in b/dlls/nsiproxy.sys/Makefile.in
+index 40ea0701a46..89ea5173bc5 100644
+--- a/dlls/nsiproxy.sys/Makefile.in
++++ b/dlls/nsiproxy.sys/Makefile.in
+@@ -1,7 +1,7 @@
+ MODULE    = nsiproxy.sys
+ UNIXLIB   = nsiproxy.so
+ IMPORTS   = ntoskrnl
+-UNIX_LIBS = $(PROCSTAT_LIBS)
++UNIX_LIBS = $(PROCSTAT_LIBS) $(IOKIT_LIBS)
+ 
+ EXTRADLLFLAGS = -Wl,--subsystem,native
+ 
+@@ -10,6 +10,7 @@ SOURCES = \
+ 	icmp_echo.c \
+ 	ip.c \
+ 	ndis.c \
++	ndis_mac.c \
+ 	nsi.c \
+ 	tcp.c \
+ 	udp.c
+diff --git a/dlls/nsiproxy.sys/ndis.c b/dlls/nsiproxy.sys/ndis.c
+index 158a39e558d..cfbd426ddc1 100644
+--- a/dlls/nsiproxy.sys/ndis.c
++++ b/dlls/nsiproxy.sys/ndis.c
+@@ -200,6 +200,10 @@ err:
+ 
+ #elif defined (HAVE_SYS_SYSCTL_H) && defined (HAVE_NET_IF_DL_H)
+ 
++#ifdef __APPLE__
++extern int ndis_mac_get_hw_address( const char *bsd_name, unsigned char *addr, unsigned int len );
++#endif
++
+ static NTSTATUS if_get_physical( const char *name, UINT *type, IF_PHYSICAL_ADDRESS *phys_addr )
+ {
+     struct if_msghdr *ifm;
+@@ -257,6 +261,14 @@ static NTSTATUS if_get_physical( const char *name, UINT *type, IF_PHYSICAL_ADDRE
+         phys_addr->Length = sdl->sdl_alen;
+         if (phys_addr->Length > sizeof(phys_addr->Address)) phys_addr->Length = 0;
+         memcpy( phys_addr->Address, LLADDR(sdl), phys_addr->Length );
++#ifdef __APPLE__
++        {
++            /* privacy placeholder handed out by macOS; see ndis_mac.c */
++            static const BYTE placeholder[6] = { 0x02, 0, 0, 0, 0, 0 };
++            if (phys_addr->Length == 6 && !memcmp( phys_addr->Address, placeholder, 6 ))
++                ndis_mac_get_hw_address( name, phys_addr->Address, 6 );
++        }
++#endif
+         break;
+     }
+ 
+diff --git a/dlls/nsiproxy.sys/ndis_mac.c b/dlls/nsiproxy.sys/ndis_mac.c
+new file mode 100644
+index 00000000000..1a18846cfad
+--- /dev/null
++++ b/dlls/nsiproxy.sys/ndis_mac.c
+@@ -0,0 +1,76 @@
++/*
++ * nsiproxy.sys macOS helpers (kept apart from the Windows headers)
++ *
++ * Copyright 2026 Nectarine contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#ifdef __APPLE__
++
++#include <string.h>
++#include <CoreFoundation/CoreFoundation.h>
++#include <IOKit/IOKitLib.h>
++#include <IOKit/network/IOEthernetInterface.h>
++#include <IOKit/network/IOEthernetController.h>
++
++/* macOS hands processes without a privileged identity a placeholder link-layer address
++ * (02:00:00:00:00:00) from sysctl/getifaddrs. IOKit still reports the real one; look it up
++ * by BSD interface name. Returns 1 on success. */
++int ndis_mac_get_hw_address( const char *bsd_name, unsigned char *addr, unsigned int len )
++{
++    io_iterator_t iter;
++    io_object_t intf;
++    int found = 0;
++
++    if (IOServiceGetMatchingServices( kIOMainPortDefault, IOServiceMatching( kIOEthernetInterfaceClass ), &iter ))
++        return 0;
++
++    while (!found && (intf = IOIteratorNext( iter )))
++    {
++        char name[64];
++        CFStringRef bsd = IORegistryEntryCreateCFProperty( intf, CFSTR( kIOBSDNameKey ), kCFAllocatorDefault, 0 );
++
++        if (bsd && CFStringGetCString( bsd, name, sizeof(name), kCFStringEncodingUTF8 ) && !strcmp( name, bsd_name ))
++        {
++            io_object_t controller;
++
++            if (!IORegistryEntryGetParentEntry( intf, kIOServicePlane, &controller ))
++            {
++                CFDataRef mac = IORegistryEntryCreateCFProperty( controller, CFSTR( kIOMACAddress ), kCFAllocatorDefault, 0 );
++                if (mac)
++                {
++                    if (CFDataGetLength( mac ) == len)
++                    {
++                        memcpy( addr, CFDataGetBytePtr( mac ), len );
++                        found = 1;
++                    }
++                    CFRelease( mac );
++                }
++                IOObjectRelease( controller );
++            }
++        }
++        if (bsd) CFRelease( bsd );
++        IOObjectRelease( intf );
++    }
++    IOObjectRelease( iter );
++    return found;
++}
++
++#endif /* __APPLE__ */
+-- 
+2.43.0
+

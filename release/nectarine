@@ -1,0 +1,98 @@
+#!/bin/bash
+# Nectarine launcher. Runs Windows Steam (no arguments) or a Windows program on the Nectarine engine.
+#   nectarine                 Windows Steam
+#   nectarine <file.exe> ...  any Windows program in the same prefix
+#   nectarine wine <args>     raw wine (winecfg, regedit, ...)
+#   nectarine crashes         list crash reports
+# Settings: KEY=VALUE lines in "$NECTARINE_HOME/user.env" (e.g. D3DM_ENABLE_METALFX=1).
+set -u
+N="${NECTARINE_HOME:-$HOME/Library/Application Support/Nectarine}"
+C="$N/engine"
+export WINEPREFIX="${WINEPREFIX:-$N/prefix}"
+STEAMDIR="$WINEPREFIX/drive_c/Program Files (x86)/Steam"
+mkdir -p "$N/logs"
+
+export NECTARINE_CRASH_DIR="$N/crashes"
+# /usr/bin/python3 is only a stub that offers to install Xcode tools unless they are present.
+have_python() { xcode-select -p >/dev/null 2>&1; }
+if [ "${1:-}" = crashes ]; then
+  have_python && exec python3 -I "$C/share/nectarine/nectarine-crash.py" --summary
+  echo "Crash summaries need Apple's command line tools (xcode-select --install). Logs: $N/logs"; exit 0
+fi
+
+# One launchd job for Steam and its games: msync registers the wineserver's Mach port with the
+# bootstrap namespace, and processes in another job cannot see it.
+export WINEMSYNC=1
+export WINEDEBUG="${WINEDEBUG:--all,err+seh}"   # err+seh: Proton starts no crash debugger without it
+export DYLD_FALLBACK_LIBRARY_PATH="$C/lib"
+export DXVK_LOG_LEVEL=none
+export ROSETTA_ADVERTISE_AVX=1
+
+# Graphics: ntdll picks a backend per process. D3D10/11/12 games get Apple's D3DMetal; if a game
+# faults on it, the next launch uses DXMT, then DXVK (state in $WINEPREFIX/nectarine/backends).
+export NECTARINE_D3D12=always NECTARINE_D3DMETAL_DIR="$C/lib/d3dmetal" NECTARINE_DXMT_DIR="$C/lib/dxmt"
+export NECTARINE_DEFAULT_BACKEND=wined3d NECTARINE_BACKEND_AUTO=1
+export CX_APPLEGPTK_LIBD3DSHARED_PATH="$C/lib/external/libd3dshared.dylib"
+export WINEDLLOVERRIDES="d3d10,d3d10_1,d3d10core,d3d11,d3d12,d3d12core,dxgi=b"
+
+# MoltenVK (DXVK and Vulkan games)
+export VK_ICD_FILENAMES="$C/lib/wine/x86_64-unix/vulkan/icd.d/MoltenVK_icd.json"
+export MVK_X_DXVK_FEATURES=1 MVK_X_FAKE_DEPTH_BOUNDS=1
+export MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=1 MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1
+export MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0 MVK_CONFIG_PRESENT_WITH_COMMAND_BUFFER=0
+export MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION=1 MVK_CONFIG_FAST_MATH_ENABLED=1
+export MVK_CONFIG_LOG_LEVEL=1
+
+# Video codecs (Media Foundation / DirectShow cutscenes) through the bundled GStreamer + FFmpeg.
+gst="$C/lib/gstreamer/GStreamer.framework/Versions/1.0"
+if [ -d "$gst" ]; then
+  export GST_PLUGIN_SYSTEM_PATH_1_0="$gst/lib/gstreamer-1.0" GST_PLUGIN_SYSTEM_PATH="$gst/lib/gstreamer-1.0"
+  export GST_PLUGIN_PATH_1_0= GST_PLUGIN_PATH=
+  export GST_PLUGIN_SCANNER_1_0="$gst/libexec/gstreamer-1.0/gst-plugin-scanner"
+  export GST_REGISTRY_1_0="$WINEPREFIX/codec-gst-registry.bin"
+fi
+
+if [ -f "$N/user.env" ]; then
+  while IFS= read -r kv; do case "$kv" in ""|\#*) ;; *=*) export "$kv" ;; esac; done < "$N/user.env"
+fi
+
+if [ "${1:-}" = wine ]; then shift; exec "$C/bin/wine" "$@"; fi
+
+LOG="$N/logs/$(date +%Y%m%d-%H%M%S)-$(basename "${1:-steam}" .exe).log"
+ln -sf "$LOG" "$N/logs/latest.log"
+START=$(date +%s)
+
+# GPU guard: repeated GPU timeouts escalate into a macOS WindowServer watchdog crash, so stop the
+# game (not Steam) at the first GPU-fault signature.
+SIG='Caused GPU Timeout|excessive GPU errors|kIOGPUCommandBufferCallbackError|MTLCommandBufferErrorDomain Code=[1-4]|VK_ERROR_DEVICE_LOST|Impacting Interactivity'
+KEEP='^(steam|steamwebhelper|steamservice|steamerrorreporter|services|winedevice|plugplay|svchost|rpcss|explorer|tabtip|conhost|wineboot|winedbg|start|cmd)\.exe$'
+guard() {
+  tail -n0 -F "$LOG" 2>/dev/null | while IFS= read -r line; do
+    [[ "$line" =~ $SIG ]] || continue
+    echo "[gpu-guard] $(date +%T) KILL: GPU fault: ${BASH_REMATCH[0]}" >> "$LOG"
+    ps -axo pid=,comm= | while read -r pid comm; do
+      exe=$(basename "${comm//\\//}")
+      case "$exe" in *.exe|*.EXE) [[ "$exe" =~ $KEEP ]] || kill -9 "$pid" 2>/dev/null ;; esac
+    done
+    osascript -e 'display notification "A game hit a GPU fault and was stopped to protect the Mac. A crash report was saved." with title "Nectarine"' 2>/dev/null
+  done
+}
+
+{
+  echo "### nectarine $(cat "$C/share/nectarine/VERSION" 2>/dev/null) engine=$("$C/bin/wine" --version 2>&1) macos=$(sw_vers -productVersion)"
+  echo "### logging=wine:$WINEDEBUG args=$*"
+} > "$LOG"
+guard & GUARD=$!; disown "$GUARD"
+if [ $# -eq 0 ]; then
+  cd "$STEAMDIR" || { echo "Steam is not installed in $WINEPREFIX; run the Nectarine installer again." >&2; exit 1; }
+  "$C/bin/wine" steam.exe -no-cef-sandbox -cef-disable-gpu-sandbox >> "$LOG" 2>&1
+else
+  cd "$(dirname "$1")" 2>/dev/null || true
+  "$C/bin/wine" "$@" >> "$LOG" 2>&1
+fi
+"$C/bin/wineserver" -w 2>/dev/null
+pkill -P "$GUARD" 2>/dev/null; kill "$GUARD" 2>/dev/null
+have_python && python3 -I "$C/share/nectarine/nectarine-crash.py" --log "$LOG" --exe "${1:-steam.exe}" --start "$START" \
+  --engine-root "$C" --prefix "$WINEPREFIX" >> "$LOG" 2>&1
+grep -q "^crash report:" "$LOG" && osascript -e 'display notification "A crash report was saved. Run: nectarine crashes" with title "Nectarine"' 2>/dev/null
+exit 0

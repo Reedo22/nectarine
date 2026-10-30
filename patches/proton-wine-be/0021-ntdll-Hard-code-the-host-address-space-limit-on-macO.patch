@@ -1,0 +1,37 @@
+From b11081a52353793986be5c41c4cd268aaaed0d48 Mon Sep 17 00:00:00 2001
+From: Brendan Shanks <bshanks@codeweavers.com>
+Date: Fri, 10 Jul 2026 14:18:27 -0700
+Subject: [PATCH 21/29] ntdll: Hard code the host address space limit on macOS.
+
+The get_host_addr_space_limit() algorithm returns 0x7fffffff0000 on
+macOS, but the actual limit is lower and hardcoded in the kernel.
+---
+ dlls/ntdll/unix/virtual.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 3efac71e190..28bc063c222 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2984,6 +2984,10 @@ static NTSTATUS map_pe_header( void *ptr, size_t size, size_t map_size, int fd,
+  */
+ static void *get_host_addr_space_limit(void)
+ {
++#ifdef __APPLE__
++    /* See MACH_VM_MAX_ADDRESS_RAW in xnu osfmk/mach/arm/vm_param.h */
++    return (void *)0x7ffffe000000;
++#else
+     unsigned int flags = MAP_PRIVATE | MAP_ANON;
+     UINT_PTR addr = (UINT_PTR)1 << 63;
+ 
+@@ -3003,6 +3007,7 @@ static void *get_host_addr_space_limit(void)
+         addr >>= 1;
+     }
+     return (void *)((addr << 1) - (granularity_mask + 1));
++#endif
+ }
+ 
+ #endif /* _WIN64 */
+-- 
+2.43.0
+

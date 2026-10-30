@@ -1,0 +1,48 @@
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index c45e62bc..2522c893 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -699,6 +699,13 @@ namespace dxvk {
+     if (m_queueMapping.graphics.family == VK_QUEUE_FAMILY_IGNORED)
+       return std::string("Device does not have a graphics queue");
+ 
++    // VK_EXT_depth_clip_enable has a dynamic equivalent in
++    // VK_EXT_extended_dynamic_state3. Accept either path; the pipeline builder
++    // uses the static extension when present and the dynamic command otherwise.
++    if (!m_featuresSupported.extDepthClipEnable.depthClipEnable
++     && !m_featuresSupported.extExtendedDynamicState3.extendedDynamicState3DepthClipEnable)
++      return std::string("Device does not support static or dynamic depth clip enable");
++
+     for (const auto& f : getFeatureList()) {
+       if (f.featureRequired && !(*f.featureEnabled)) {
+         std::string message = str::format("Device does not support required feature '", f.readableName, "'");
+@@ -870,7 +877,7 @@ namespace dxvk {
+       ENABLE_EXT_FEATURE(extCustomBorderColor, customBorderColorWithoutFormat, false),
+ 
+       /* Depth clip matches D3D semantics where depth clamp does not */
+-      ENABLE_EXT_FEATURE(extDepthClipEnable, depthClipEnable, true),
++      ENABLE_EXT_FEATURE(extDepthClipEnable, depthClipEnable, false),
+ 
+       /* Controls depth bias behaviour with emulated depth formats */
+       ENABLE_EXT_FEATURE(extDepthBiasControl, depthBiasControl, false),
+diff --git a/src/dxvk/dxvk_graphics.cpp b/src/dxvk/dxvk_graphics.cpp
+index a3ee4148..b0ca1d89 100644
+--- a/src/dxvk/dxvk_graphics.cpp
++++ b/src/dxvk/dxvk_graphics.cpp
+@@ -578,10 +578,12 @@ namespace dxvk {
+       rsInfo.rasterizerDiscardEnable = VK_TRUE;
+     }
+ 
+-    // Set up depth clip state. Require depth clip support,
+-    // this is *not* equivalent to disabling depth clamp.
+-    rsDepthClipInfo.pNext = std::exchange(rsInfo.pNext, &rsDepthClipInfo);
+-    rsDepthClipInfo.depthClipEnable = state.rs.depthClipEnable();
++    // Use the static depth clip state when available. Otherwise the equivalent
++    // VK_EXT_extended_dynamic_state3 command is emitted by DxvkContext.
++    if (device->features().extDepthClipEnable.depthClipEnable) {
++      rsDepthClipInfo.pNext = std::exchange(rsInfo.pNext, &rsDepthClipInfo);
++      rsDepthClipInfo.depthClipEnable = state.rs.depthClipEnable();
++    }
+ 
+     // Set up conservative rasterization if requested by the application.
+     if (state.rs.conservativeMode() != VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT) {

@@ -1,0 +1,169 @@
+From f1989358c449d1c5da6342a5a15bb456e12f0f7f Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sun, 25 Oct 2026 21:48:35 -0400
+Subject: [PATCH 06/11] graphics: Match D3DMetal adapter identity for Diablo IV
+ and CS2.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Port CrossOver 23560 and 23042 with exact backend gating. Query DXGI for Diablo IV’s SetupAPI GPU LUID, and match CS2’s D3D9 driver identity to its D3DMetal adapter. Avoid the ambiguous DXGI version-resource heuristic.
+---
+ dlls/setupapi/devinst.c   | 90 +++++++++++++++++++++++++++++++++++++++
+ dlls/wined3d/adapter_gl.c | 25 +++++++++++
+ 2 files changed, 115 insertions(+)
+
+diff --git a/dlls/setupapi/devinst.c b/dlls/setupapi/devinst.c
+index 7d449481787..9c8d25873b5 100644
+--- a/dlls/setupapi/devinst.c
++++ b/dlls/setupapi/devinst.c
+@@ -46,6 +46,9 @@
+ 
+ #include "setupapi_private.h"
+ 
++#define COBJMACROS
++#include "dxgi.h"
++
+ #include "initguid.h"
+ #include "devpkey.h"
+ 
+@@ -4464,6 +4467,84 @@ out:
+     return retval;
+ }
+ 
++/* CW HACK 23560: Diablo IV needs GPU LUIDs to match between setupapi and (D3DMetal's) dxgi */
++#ifdef __x86_64__
++
++static const DEVPROPKEY DEVPROPKEY_GPU_LUID =
++{ { 0x60b193cb, 0x5276, 0x4d0f, { 0x96, 0xfc, 0xf1, 0x73, 0xab, 0xad, 0x3e, 0xc6 } }, 2 };
++
++static const GUID my_IDXGIFactory =
++{ 0x7b7166ec, 0x21c7, 0x44ae, { 0xb2,0x1a, 0xc9,0xae,0x32,0x1a,0xe3,0x69 } };
++
++static BOOL CALLBACK check_is_diablo_iv(INIT_ONCE *once, void *param, void **context)
++{
++    BOOL *is_d4 = param;
++    WCHAR name[MAX_PATH], *module_exe;
++    if (GetModuleFileNameW(NULL, name, ARRAYSIZE(name)))
++    {
++        module_exe = wcsrchr(name, '\\');
++        module_exe = module_exe ? module_exe + 1 : name;
++        *is_d4 = !wcsicmp(module_exe, L"Diablo IV.exe");
++    }
++
++    return TRUE;
++}
++
++static BOOL is_diablo_iv(void)
++{
++    static BOOL is_d4 = FALSE;
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++    InitOnceExecuteOnce(&once, check_is_diablo_iv, &is_d4, NULL);
++    return is_d4;
++}
++
++static BOOL using_d3dmetal(void)
++{
++    WCHAR backend[16];
++
++    return GetEnvironmentVariableW(L"CX_ACTIVE_GRAPHICS_BACKEND", backend, ARRAY_SIZE(backend)) == 8 &&
++           !wcscmp(backend, L"d3dmetal");
++}
++
++static void get_luid_from_d3dmetal(LUID *luid)
++{
++    /* Diablo IV retrieves the GPU LUID through setupapi and expects it to match the LUID reported by
++     * D3DMetal.
++     *
++     * For now, load D3DMetal's dxgi and get its LUID.
++     *
++     * This assumes there's only one GPU (which is currently always true on Apple Silicon Macs).
++     */
++    HMODULE dxgi;
++    typeof(CreateDXGIFactory) *dxgi_CreateDXGIFactory;
++    IDXGIFactory *factory = NULL;
++    IDXGIAdapter *adapter = NULL;
++    DXGI_ADAPTER_DESC desc;
++
++    if (!(dxgi = LoadLibraryW(L"dxgi.dll"))) return;
++
++    dxgi_CreateDXGIFactory = (void *)GetProcAddress(dxgi, "CreateDXGIFactory");
++    if (!dxgi_CreateDXGIFactory) goto done;
++
++    dxgi_CreateDXGIFactory(&my_IDXGIFactory, (void **)&factory);
++    if (!factory) goto done;
++
++    IDXGIFactory_EnumAdapters(factory, 0, &adapter);
++    if (!adapter) goto done;
++
++    if (IDXGIAdapter_GetDesc(adapter, &desc) != S_OK)
++        goto done;
++
++    TRACE("Using LUID %08lx:%08lx from D3DMetal dxgi\n", desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart);
++    memcpy(luid, &desc.AdapterLuid, sizeof(*luid));
++
++done:
++    if (adapter) IDXGIAdapter_Release(adapter);
++    if (factory) IDXGIFactory_Release(factory);
++    FreeLibrary(dxgi);
++}
++#endif
++
+ BOOL WINAPI SetupDiGetDevicePropertyKeys( HDEVINFO devinfo, PSP_DEVINFO_DATA device_data,
+                                           DEVPROPKEY *prop_keys, DWORD prop_keys_len,
+                                           DWORD *required_prop_keys, DWORD flags )
+@@ -4585,6 +4666,15 @@ BOOL WINAPI SetupDiGetDevicePropertyW(HDEVINFO devinfo, PSP_DEVINFO_DATA device_
+     ls = get_device_property(device, devinfo, device_data, prop_key, prop_type, prop_buff, prop_buff_size,
+                              required_size, flags);
+ 
++#ifdef __x86_64__
++    /* CW HACK 23560 */
++    if (ls == NO_ERROR && prop_buff && prop_buff_size == sizeof(LUID) &&
++        IsEqualDevPropKey(*prop_key, DEVPROPKEY_GPU_LUID) && using_d3dmetal() && is_diablo_iv())
++    {
++        get_luid_from_d3dmetal((LUID *)prop_buff);
++    }
++#endif
++
+     SetLastError(ls);
+     return !ls;
+ }
+diff --git a/dlls/wined3d/adapter_gl.c b/dlls/wined3d/adapter_gl.c
+index e33e27b4cc3..88592b583fd 100644
+--- a/dlls/wined3d/adapter_gl.c
++++ b/dlls/wined3d/adapter_gl.c
+@@ -3805,6 +3805,31 @@ static BOOL wined3d_adapter_init_gl_caps(struct wined3d_adapter_gl *adapter_gl,
+         device = wined3d_guess_card(feature_level, gl_renderer_str, &gl_vendor, &vendor);
+         TRACE("Guessed device PCI ID 0x%04x.\n", device);
+ 
++#ifdef __x86_64__
++        /* CW HACK 23042: Counter-Strike 2 uses D3D9 to get the driver version, but D3D11 for everything else.
++         * D3DMetal reports the GPU is AMD, and the game expects the D3D9 DriverVersion number to be for an AMD driver.
++         * Apple GPUs end up reporting as an 8800 GTX since they hit fallback paths and Apple OGL only supports FL10_1.
++         * Replace that with a recent AMD GPU so an AMD driver version is returned and the check succeeds.
++         */
++        if (vendor == HW_VENDOR_NVIDIA && device == CARD_NVIDIA_GEFORCE_8800GTX && strstr(gl_vendor_str, "Apple"))
++        {
++            WCHAR name[MAX_PATH], backend[16], *module_exe;
++            if (GetEnvironmentVariableW(L"CX_ACTIVE_GRAPHICS_BACKEND", backend, ARRAY_SIZE(backend)) == 8 &&
++                !wcscmp(backend, L"d3dmetal") && GetModuleFileNameW(NULL, name, ARRAY_SIZE(name)))
++            {
++                module_exe = wcsrchr(name, '\\');
++                module_exe = module_exe ? module_exe + 1 : name;
++
++                if (!lstrcmpW(module_exe, L"cs2.exe"))
++                {
++                    vendor = HW_VENDOR_AMD;
++                    device = CARD_AMD_RADEON_RX_480;
++                }
++            }
++        }
++
++#endif
++
+         if (!(caps_gl_ctx->gpu_description = wined3d_get_gpu_description(vendor, device)))
+         {
+             ERR("Card %04x:%04x not found in driver DB.\n", vendor, device);
+-- 
+2.43.0
+

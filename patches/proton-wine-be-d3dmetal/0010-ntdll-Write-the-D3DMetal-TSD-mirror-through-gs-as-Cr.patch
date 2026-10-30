@@ -1,0 +1,47 @@
+From ad65ae1e7e4b97abd9bfffd6d3c222b7a54b5e05 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Mon, 26 Oct 2026 16:49:48 -0400
+Subject: [PATCH 10/11] ntdll: Write the D3DMetal TSD mirror through %gs, as
+ CrossOver does.
+
+Under Rosetta the x86 %gs base is emulated, and the kernel's thread_handle (pthread_teb) need not be
+the memory %gs addresses, so writes through pthread_teb left %gs:0x30 unmirrored and PE code read
+garbage (NtCurrentTeb() -> 0x4200000038, NULL process heap). Log when the two differ.
+---
+ dlls/ntdll/unix/signal_x86_64.c | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 2d46b0cb729..9cc730abdbc 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -3156,11 +3156,22 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend,
+             ERR( "could not obtain the pthread TSD for D3DMetal\n" );
+             abort_thread(1);
+         }
++        void *check;
++
+         /* CrossOver's macOS model: never move %gs away from pthread's TSD.
+-         * Only these Windows fields can be overlaid on its reserved slots. */
+-        pthread_teb->Tib.Self = teb->Tib.Self;
+-        pthread_teb->ThreadLocalStoragePointer = teb->ThreadLocalStoragePointer;
+-        pthread_teb->Peb = teb->Peb;
++         * Only these Windows fields can be overlaid on its reserved slots. Write them through
++         * %gs itself, as CrossOver does: under Rosetta the emulated %gs base need not be the
++         * kernel's thread_handle, and PE code only ever reads them through %gs. */
++        __asm__ volatile( "movq %0,%%gs:%c1" :: "r" (teb->Tib.Self), "n" (FIELD_OFFSET(TEB, Tib.Self)) );
++        __asm__ volatile( "movq %0,%%gs:%c1" :: "r" (teb->ThreadLocalStoragePointer),
++                          "n" (FIELD_OFFSET(TEB, ThreadLocalStoragePointer)) );
++        __asm__ volatile( "movq %0,%%gs:%c1" :: "r" (teb->Peb), "n" (FIELD_OFFSET(TEB, Peb)) );
++        if (pthread_teb->Tib.Self != teb->Tib.Self)
++        {
++            __asm__ volatile( "movq %%gs:0,%0" : "=r" (check) );
++            ERR( "pthread_teb %p is not the %%gs TSD (gs:0 = %p); cross-thread TLS mirror updates will miss\n",
++                 pthread_teb, check );
++        }
+         /* The PE loader and virtual_set_tls_information_teb() update this mirror. */
+         teb->Instrumentation[0] = pthread_teb;
+         TRACE_(seh)( "using pthread gsbase %p for teb %p\n", pthread_teb, teb );
+-- 
+2.43.0
+

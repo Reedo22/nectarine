@@ -1,0 +1,470 @@
+From f4cb4c64d4b18bf44d0cc409eddb7115cdf205a5 Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sun, 25 Oct 2026 21:38:32 -0400
+Subject: [PATCH 2/2] Lower pass-through geometry shaders to vertex Layer
+ export
+
+Metal has no geometry stage, so MoltenVK dropped GS stages and layered draws all landed
+in slice 0 (Unreal color-grading LUT -> black scene). A GS that only forwards its triangle
+and copies one varying into Layer is rewritten as a VS that exports Layer; anything else is
+reported. MVK_X_NO_GS_LOWERING=1 disables it.
+---
+ .../GPUObjects/MVKGeometryPassthrough.h       | 383 ++++++++++++++++++
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm   |  30 ++
+ 2 files changed, 413 insertions(+)
+ create mode 100644 MoltenVK/MoltenVK/GPUObjects/MVKGeometryPassthrough.h
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKGeometryPassthrough.h b/MoltenVK/MoltenVK/GPUObjects/MVKGeometryPassthrough.h
+new file mode 100644
+index 00000000..dc1b8e71
+--- /dev/null
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKGeometryPassthrough.h
+@@ -0,0 +1,383 @@
++// Experimental lowering of a deliberately narrow geometry-shader subset.
++// Prove that a straight-line GS emits its three input vertices unchanged, with
++// Layer copied bit-for-bit from one input varying, then export Layer from VS.
++// Unsupported control flow, resources, arithmetic or output changes fail closed.
++#pragma once
++
++#include "spirv.hpp"
++#include <algorithm>
++#include <cstdint>
++#include <map>
++#include <string>
++#include <vector>
++
++namespace mvk_gs {
++using Words = std::vector<uint32_t>;
++struct Inst { spv::Op op; Words w; };
++struct Atom {
++    uint32_t var = 0, offset = 0;
++    bool literal = false;
++    bool operator==(const Atom& b) const {
++        return var == b.var && offset == b.offset && literal == b.literal;
++    }
++};
++using Value = std::vector<Atom>;
++struct Ptr { uint32_t var = 0, offset = 0, type = 0; };
++struct Decoration { uint32_t location = ~0u, builtin = ~0u; bool unsupported = false; };
++struct LayerExport { uint32_t location = ~0u, component = 0; };
++
++class Module {
++public:
++    std::vector<Inst> code;
++    std::map<uint32_t, Inst> types;
++    std::map<uint32_t, Value> values, memory;
++    std::map<uint32_t, Ptr> pointers;
++    std::map<uint32_t, uint32_t> storage;
++    std::map<uint32_t, Decoration> decorations;
++    std::map<uint32_t, std::map<uint32_t, Decoration>> members;
++    std::map<uint32_t, std::vector<Inst>> functions;
++    std::vector<std::map<uint32_t, Value>> emissions;
++    uint32_t entry = 0;
++    bool triangles = false, strip = false, vertices3 = false;
++
++    uint32_t count(uint32_t id, unsigned depth = 0) const {
++        auto it = types.find(id);
++        if (it == types.end() || depth > 12) return 0;
++        const Inst& t = it->second;
++        if (t.op == spv::OpTypeFloat || t.op == spv::OpTypeInt)
++            return t.w[2] == 32 ? 1 : 0;
++        if (t.op == spv::OpTypeVector || t.op == spv::OpTypeArray) {
++            uint32_t n = t.op == spv::OpTypeVector ? t.w[3] : literal(t.w[3]);
++            uint32_t c = count(t.w[2], depth + 1);
++            return n && c && n <= 4096 / c ? n * c : 0;
++        }
++        if (t.op == spv::OpTypeStruct) {
++            uint32_t n = 0;
++            for (size_t i = 2; i < t.w.size(); i++) {
++                uint32_t c = count(t.w[i], depth + 1);
++                if (!c || c > 4096 - n) return 0;
++                n += c;
++            }
++            return n;
++        }
++        return 0;
++    }
++    uint32_t literal(uint32_t id) const {
++        auto it = values.find(id);
++        return it != values.end() && it->second.size() == 1 && it->second[0].literal
++            ? it->second[0].offset : ~0u;
++    }
++    bool descend(uint32_t& type, uint32_t index, uint32_t& offset) const {
++        auto it = types.find(type);
++        if (it == types.end()) return false;
++        const Inst& t = it->second;
++        if (t.op == spv::OpTypeVector || t.op == spv::OpTypeArray) {
++            uint32_t n = t.op == spv::OpTypeVector ? t.w[3] : literal(t.w[3]);
++            if (index >= n || n > 4096) return false;
++            type = t.w[2]; offset += index * count(type);
++            return count(type) != 0;
++        }
++        if (t.op == spv::OpTypeStruct) {
++            if (index >= t.w.size() - 2) return false;
++            for (uint32_t i = 0; i < index; i++) offset += count(t.w[i + 2]);
++            type = t.w[index + 2]; return count(type) != 0;
++        }
++        return false;
++    }
++    bool parse(const Words& words, spv::ExecutionModel model, const char* name) {
++        if (words.size() < 5 || words[0] != spv::MagicNumber) return false;
++        uint32_t fn = 0;
++        for (size_t p = 5; p < words.size();) {
++            uint32_t n = words[p] >> 16;
++            if (!n || n > words.size() - p) return false;
++            Inst i{spv::Op(words[p] & 0xffff), Words(words.begin() + p, words.begin() + p + n)};
++            code.push_back(i); const Words& w = i.w;
++            if (i.op == spv::OpFunction) { if (n != 5) return false; fn = w[2]; }
++            else if (i.op == spv::OpFunctionEnd) fn = 0;
++            else if (fn) functions[fn].push_back(i);
++            else if (i.op >= spv::OpTypeVoid && i.op <= spv::OpTypeFunction) {
++                if (n < 2) return false; types[w[1]] = i;
++            } else if (i.op == spv::OpConstant && n == 4) {
++                values[w[2]] = Value{{0, w[3], true}};
++            } else if (i.op == spv::OpConstantNull || i.op == spv::OpUndef) {
++                if (n != 3 || !count(w[1])) return false;
++                values[w[2]] = Value(count(w[1]), Atom{0, 0, i.op == spv::OpConstantNull});
++            } else if (i.op == spv::OpConstantComposite) {
++                Value v;
++                for (size_t k = 3; k < w.size(); k++) {
++                    if (!values.count(w[k])) return false;
++                    v.insert(v.end(), values[w[k]].begin(), values[w[k]].end());
++                }
++                values[w[2]] = v;
++            } else if (i.op == spv::OpVariable) {
++                if (n < 4 || !types.count(w[1]) || types[w[1]].op != spv::OpTypePointer) return false;
++                uint32_t t = types[w[1]].w[3], c = count(t);
++                if (!c) return false;
++                pointers[w[2]] = {w[2], 0, t}; storage[w[2]] = w[3];
++                Value v(c);
++                if (w[3] == spv::StorageClassInput)
++                    for (uint32_t k = 0; k < c; k++) v[k] = {w[2], k, false};
++                if (n == 5) { if (values[w[4]].size() != c) return false; v = values[w[4]]; }
++                memory[w[2]] = v;
++            } else if (i.op == spv::OpDecorate && n >= 3) {
++                auto& d = decorations[w[1]];
++                if (w[2] == spv::DecorationLocation && n == 4) d.location = w[3];
++                else if (w[2] == spv::DecorationBuiltIn && n == 4) d.builtin = w[3];
++                else if (w[2] == spv::DecorationXfbBuffer || w[2] == spv::DecorationXfbStride ||
++                         w[2] == spv::DecorationStream || w[2] == spv::DecorationComponent) d.unsupported = true;
++            } else if (i.op == spv::OpMemberDecorate && n >= 4) {
++                if (w[3] == spv::DecorationBuiltIn && n == 5) members[w[1]][w[2]].builtin = w[4];
++                else members[w[1]][w[2]].unsupported = true;
++            } else if (i.op == spv::OpDecorationGroup || i.op == spv::OpGroupDecorate || i.op == spv::OpGroupMemberDecorate)
++                return false;
++            else if (i.op == spv::OpEntryPoint && n >= 4) {
++                const char* s = reinterpret_cast<const char*>(&w[3]);
++                size_t bytes = (w.size() - 3) * 4, len = 0;
++                while (len < bytes && s[len]) len++;
++                if (len == bytes) return false;
++                if (w[1] == uint32_t(model) && std::string(s, len) == name) entry = w[2];
++            }
++            p += n;
++        }
++        return entry != 0;
++    }
++
++    bool execute(uint32_t fn, unsigned depth = 0) {
++        if (depth > 8 || !functions.count(fn)) return false;
++        for (const auto& i : functions[fn]) {
++            const Words& w = i.w;
++            switch (i.op) {
++                case spv::OpLabel: case spv::OpNop: case spv::OpLine: case spv::OpNoLine: break;
++                case spv::OpReturn: return true;
++                case spv::OpFunctionCall:
++                    if (w.size() != 4 || !execute(w[3], depth + 1)) return false;
++                    break;
++                case spv::OpAccessChain: case spv::OpInBoundsAccessChain: {
++                    if (w.size() < 4 || !pointers.count(w[3])) return false;
++                    Ptr p = pointers[w[3]];
++                    for (size_t k = 4; k < w.size(); k++)
++                        if (!descend(p.type, literal(w[k]), p.offset)) return false;
++                    pointers[w[2]] = p; break;
++                }
++                case spv::OpLoad: {
++                    if (w.size() != 4 || !pointers.count(w[3])) return false;
++                    Ptr p = pointers[w[3]]; uint32_t c = count(w[1]);
++                    const auto& m = memory[p.var];
++                    if (!c || p.offset > m.size() || c > m.size() - p.offset) return false;
++                    values[w[2]] = Value(m.begin() + p.offset, m.begin() + p.offset + c); break;
++                }
++                case spv::OpStore: {
++                    if (w.size() != 3 || !pointers.count(w[1]) || !values.count(w[2])) return false;
++                    Ptr p = pointers[w[1]]; auto& m = memory[p.var]; const auto& v = values[w[2]];
++                    if (storage[p.var] == spv::StorageClassInput || v.size() != count(p.type) ||
++                        p.offset > m.size() || v.size() > m.size() - p.offset) return false;
++                    std::copy(v.begin(), v.end(), m.begin() + p.offset); break;
++                }
++                case spv::OpBitcast: case spv::OpCopyObject:
++                    if (w.size() != 4 || values[w[3]].size() != count(w[1])) return false;
++                    values[w[2]] = values[w[3]]; break;
++                case spv::OpVectorShuffle: {
++                    if (w.size() < 6) return false;
++                    Value v = values[w[3]], r;
++                    v.insert(v.end(), values[w[4]].begin(), values[w[4]].end());
++                    for (size_t k = 5; k < w.size(); k++) {
++                        if (w[k] == ~0u) r.push_back({});
++                        else { if (w[k] >= v.size()) return false; r.push_back(v[w[k]]); }
++                    }
++                    if (r.size() != count(w[1])) return false;
++                    values[w[2]] = r; break;
++                }
++                case spv::OpCompositeInsert: case spv::OpCompositeExtract: {
++                    bool ins = i.op == spv::OpCompositeInsert;
++                    if (w.size() < (ins ? 6u : 5u)) return false;
++                    uint32_t composite = w[ins ? 4 : 3], t = 0, off = 0;
++                    if (ins) t = w[1];
++                    else {
++                        // Result type of the defining instruction.
++                        for (const auto& list : functions) for (const auto& def : list.second)
++                            if (def.w.size() >= 3 && def.w[2] == composite &&
++                                (def.op == spv::OpLoad || def.op == spv::OpVectorShuffle ||
++                                 def.op == spv::OpCompositeInsert || def.op == spv::OpCopyObject)) t = def.w[1];
++                    }
++                    for (size_t k = ins ? 5 : 4; k < w.size(); k++)
++                        if (!descend(t, w[k], off)) return false;
++                    uint32_t n = count(t); Value v = values[composite];
++                    if (!n || off > v.size() || n > v.size() - off) return false;
++                    if (ins) {
++                        if (values[w[3]].size() != n) return false;
++                        std::copy(values[w[3]].begin(), values[w[3]].end(), v.begin() + off);
++                        values[w[2]] = v;
++                    } else values[w[2]] = Value(v.begin() + off, v.begin() + off + n);
++                    break;
++                }
++                case spv::OpEmitVertex:
++                    if (emissions.size() >= 3) return false;
++                    emissions.push_back(memory); break;
++                case spv::OpEndPrimitive:
++                    if (emissions.size() != 3) return false;
++                    break;
++                default: return false;
++            }
++        }
++        return false;
++    }
++
++    // Only simple location variables and a single-member Position block.
++    Decoration interface(uint32_t var, bool input) {
++        Decoration d = decorations[var]; uint32_t t = pointers[var].type;
++        if (input) {
++            if (types[t].op != spv::OpTypeArray || literal(types[t].w[3]) != 3) { d.unsupported = true; return d; }
++            t = types[t].w[2];
++        }
++        if (types[t].op == spv::OpTypeStruct) {
++            if (types[t].w.size() != 3 || members[t][0].builtin != spv::BuiltInPosition || members[t][0].unsupported)
++                d.unsupported = true;
++            else d.builtin = spv::BuiltInPosition;
++        }
++        return d;
++    }
++    bool analyze(LayerExport& layer) {
++        for (const auto& i : code) {
++            if (i.op != spv::OpExecutionMode || i.w[1] != entry) continue;
++            const Words& w = i.w;
++            switch (w[2]) {
++                case spv::ExecutionModeTriangles: triangles = true; break;
++                case spv::ExecutionModeOutputTriangleStrip: strip = true; break;
++                case spv::ExecutionModeOutputVertices: vertices3 = w.size() == 4 && w[3] == 3; break;
++                case spv::ExecutionModeInvocations: if (w.size() != 4 || w[3] != 1) return false; break;
++                case spv::ExecutionModeSignedZeroInfNanPreserve: break;
++                default: return false;
++            }
++        }
++        for (auto s : storage)
++            if (s.second != spv::StorageClassInput && s.second != spv::StorageClassOutput && s.second != spv::StorageClassPrivate) return false;
++        if (!triangles || !strip || !vertices3 || !execute(entry) || emissions.size() != 3) return false;
++        bool position = false, foundLayer = false;
++        for (auto s : storage) {
++            if (s.second != spv::StorageClassOutput) continue;
++            uint32_t out = s.first, n = count(pointers[out].type);
++            Decoration d = interface(out, false);
++            if (d.unsupported) return false;
++            if (d.builtin == spv::BuiltInLayer) {
++                if (foundLayer || n != 1) return false;
++                Atom a = emissions[0][out][0];
++                if (!a.var || a.literal || storage[a.var] != spv::StorageClassInput) return false;
++                Decoration src = interface(a.var, true);
++                uint32_t stride = count(pointers[a.var].type) / 3;
++                if (src.unsupported || src.location == ~0u || stride > 4 || a.offset >= stride) return false;
++                // Each emission may copy its own vertex's value or vertex 0's for all three; both
++                // equal the leading vertex's, which is the layer D3D and Metal use per primitive.
++                bool own = true, first = true;
++                for (uint32_t v = 0; v < 3; v++) {
++                    own &= emissions[v][out][0] == Atom{a.var, v * stride + a.offset, false};
++                    first &= emissions[v][out][0] == Atom{a.var, a.offset, false};
++                }
++                if (!own && !first) return false;
++                layer = {src.location, a.offset}; foundLayer = true;
++            } else {
++                uint32_t source = 0;
++                for (auto in : storage) {
++                    if (in.second != spv::StorageClassInput) continue;
++                    Decoration x = interface(in.first, true);
++                    if (!x.unsupported && x.location == d.location && x.builtin == d.builtin &&
++                        count(pointers[in.first].type) == 3 * n) {
++                        if (source) return false;
++                        source = in.first;
++                    }
++                }
++                if (!source || (d.location == ~0u && d.builtin != spv::BuiltInPosition)) return false;
++                for (uint32_t v = 0; v < 3; v++) for (uint32_t c = 0; c < n; c++)
++                    if (!(emissions[v][out][c] == Atom{source, v * n + c, false})) return false;
++                position |= d.builtin == spv::BuiltInPosition;
++            }
++        }
++        return position && foundLayer;
++    }
++};
++
++inline void emit(Words& dst, spv::Op op, std::initializer_list<uint32_t> args) {
++    dst.push_back((uint32_t(args.size() + 1) << 16) | uint32_t(op));
++    dst.insert(dst.end(), args.begin(), args.end());
++}
++
++inline bool lower(const Words& vs, const char* vsEntry, const Words& gs, const char* gsEntry,
++                  Words& result, LayerExport& layer) {
++    Module g;
++    if (!g.parse(gs, spv::ExecutionModelGeometry, gsEntry) || !g.analyze(layer)) return false;
++    // Parse only VS declarations; general VS code is preserved verbatim.
++    Module v;
++    if (!v.parse(vs, spv::ExecutionModelVertex, vsEntry)) return false;
++    uint32_t source = 0, type = 0;
++    for (auto s : v.storage) if (s.second == spv::StorageClassOutput) {
++        auto d = v.decorations[s.first];
++        if (d.builtin == spv::BuiltInLayer) return false;
++        if (d.location == layer.location) {
++            if (source || d.unsupported) return false;
++            source = s.first; type = v.pointers[source].type;
++        }
++    }
++    if (!source || layer.component >= v.count(type) || v.count(type) > 4) return false;
++    uint32_t scalarType = type;
++    if (v.types[type].op == spv::OpTypeVector) scalarType = v.types[type].w[2];
++    if ((v.types[scalarType].op != spv::OpTypeInt && v.types[scalarType].op != spv::OpTypeFloat) || v.count(scalarType) != 1) return false;
++    uint32_t next = vs[3], u32 = 0, ptr = 0;
++    Words decl;
++    for (const auto& t : v.types)
++        if (t.second.op == spv::OpTypeInt && t.second.w[2] == 32 && t.second.w[3] == 0) u32 = t.first;
++    if (!u32) { u32 = next++; emit(decl, spv::OpTypeInt, {u32, 32, 0}); }
++    for (const auto& t : v.types)
++        if (t.second.op == spv::OpTypePointer && t.second.w[2] == spv::StorageClassOutput && t.second.w[3] == u32) ptr = t.first;
++    if (!ptr) { ptr = next++; emit(decl, spv::OpTypePointer, {ptr, spv::StorageClassOutput, u32}); }
++    uint32_t output = next++;
++    emit(decl, spv::OpVariable, {ptr, output, spv::StorageClassOutput});
++    result.assign(vs.begin(), vs.begin() + 5);
++    bool cap = false, ext = false, annotated = false, declared = false;
++    uint32_t currentFn = 0;
++    for (const auto& i : v.code) {
++        if (i.op == spv::OpCapability && i.w[1] == spv::CapabilityShaderViewportIndexLayerEXT) cap = true;
++        if (i.op == spv::OpExtension && std::string(reinterpret_cast<const char*>(&i.w[1])) == "SPV_EXT_shader_viewport_index_layer") ext = true;
++    }
++    if (!cap) emit(result, spv::OpCapability, {spv::CapabilityShaderViewportIndexLayerEXT});
++    bool insertedExt = false;
++    for (const auto& i : v.code) {
++        if (i.op != spv::OpCapability && !insertedExt) {
++            insertedExt = true;
++            if (!ext) {
++                const char name[] = "SPV_EXT_shader_viewport_index_layer";
++                Words w(1 + (sizeof(name) + 3) / 4, 0);
++                w[0] = uint32_t(w.size() << 16) | uint32_t(spv::OpExtension);
++                std::copy(name, name + sizeof(name), reinterpret_cast<char*>(&w[1]));
++                result.insert(result.end(), w.begin(), w.end());
++            }
++        }
++        if (!annotated && i.op >= spv::OpTypeVoid && i.op <= spv::OpTypeFunction) {
++            emit(result, spv::OpDecorate, {output, spv::DecorationBuiltIn, spv::BuiltInLayer}); annotated = true;
++        }
++        if (i.op == spv::OpFunction) {
++            if (!declared) { result.insert(result.end(), decl.begin(), decl.end()); declared = true; }
++            currentFn = i.w[2];
++        }
++        if (i.op == spv::OpReturn && currentFn == v.entry) {
++            uint32_t load = next++;
++            emit(result, spv::OpLoad, {type, load, source});
++            if (v.types[type].op == spv::OpTypeVector) {
++                uint32_t component = next++;
++                emit(result, spv::OpCompositeExtract, {scalarType, component, load, layer.component}); load = component;
++            }
++            uint32_t bits = load;
++            if (scalarType != u32) {
++                bits = next++;
++                emit(result, spv::OpBitcast, {u32, bits, load});
++            }
++            emit(result, spv::OpStore, {output, bits});
++        }
++        Words w = i.w;
++        if (i.op == spv::OpEntryPoint && w[1] == spv::ExecutionModelVertex && w[2] == v.entry) {
++            w.push_back(output); w[0] += 1u << 16;
++        }
++        result.insert(result.end(), w.begin(), w.end());
++    }
++    result[3] = next;
++    return annotated && declared;
++}
++} // namespace mvk_gs
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 4d9c7915..402c3bf4 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -25,6 +25,7 @@
+ #include "MVKStrings.h"
+ #include "MTLRenderPipelineDescriptor+MoltenVK.h"
+ #include "mvk_datatypes.hpp"
++#include "MVKGeometryPassthrough.h"
+ #include <sys/stat.h>
+ #include <sstream>
+ 
+@@ -773,6 +774,7 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 	const VkPipelineShaderStageCreateInfo* pTessCtlSS = nullptr;
+ 	const VkPipelineShaderStageCreateInfo* pTessEvalSS = nullptr;
+ 	const VkPipelineShaderStageCreateInfo* pFragmentSS = nullptr;
++	const VkPipelineShaderStageCreateInfo* pGeometrySS = nullptr;
+ 	VkPipelineCreationFeedback* pVertexFB = nullptr;
+ 	VkPipelineCreationFeedback* pTessCtlFB = nullptr;
+ 	VkPipelineCreationFeedback* pTessEvalFB = nullptr;
+@@ -798,6 +800,9 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 					pTessEvalFB = &pFeedbackInfo->pPipelineStageCreationFeedbacks[i];
+ 				}
+ 				break;
++			case VK_SHADER_STAGE_GEOMETRY_BIT:
++				pGeometrySS = pSS;
++				break;
+ 			case VK_SHADER_STAGE_FRAGMENT_BIT:
+ 				pFragmentSS = pSS;
+ 				if (pFeedbackInfo && pFeedbackInfo->pPipelineStageCreationFeedbacks) {
+@@ -810,6 +815,31 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 	}
+ 
+ 	_vertexModule = getOrCreateShaderModule(device, pVertexSS, _ownsVertexModule);
++	// Metal has no geometry stage. A GS that only forwards its triangle and copies one input
++	// varying into Layer (D3D11 SV_RenderTargetArrayIndex; UE uses it for its color-grading LUT)
++	// is exactly a vertex shader that exports Layer, so rewrite the VS that way. Anything else
++	// fails closed and is reported, instead of the GS being silently dropped.
++	if (pGeometrySS && _vertexModule && pVertexSS && !getenv("MVK_X_NO_GS_LOWERING")) {
++		bool ownsGeometryModule = false;
++		MVKShaderModule* gsModule = getOrCreateShaderModule(device, pGeometrySS, ownsGeometryModule);
++		mvk_gs::Words lowered;
++		mvk_gs::LayerExport layer;
++		if (gsModule && mvk_gs::lower(_vertexModule->getSPIRV(), pVertexSS->pName,
++									  gsModule->getSPIRV(), pGeometrySS->pName, lowered, layer)) {
++			VkShaderModuleCreateInfo smci = {};
++			smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++			smci.codeSize = lowered.size() * sizeof(uint32_t);
++			smci.pCode = lowered.data();
++			MVKShaderModule* vsModule = new MVKShaderModule(device, &smci);
++			if (_ownsVertexModule) { delete _vertexModule; }
++			_vertexModule = vsModule;
++			_ownsVertexModule = true;
++			MVKLogInfo("Lowered pass-through geometry shader: vertex shader now exports Layer from location %u component %u.", layer.location, layer.component);
++		} else {
++			reportWarning(VK_ERROR_FEATURE_NOT_PRESENT, "Geometry shader is not a supported pass-through and is ignored; output may be wrong.");
++		}
++		if (ownsGeometryModule) { delete gsModule; }
++	}
+ 	_tessCtlModule = getOrCreateShaderModule(device, pTessCtlSS, _ownsTessCtlModule);
+ 	_tessEvalModule = getOrCreateShaderModule(device, pTessEvalSS, _ownsTessEvalModule);
+ 	_fragmentModule = getOrCreateShaderModule(device, pFragmentSS, _ownsFragmentModule);
+-- 
+2.54.0 (Apple Git-157)
+

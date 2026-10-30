@@ -1,0 +1,44 @@
+From 4ce4a974c6d8deb2c311b4f7e61e9a4fd4c51c3b Mon Sep 17 00:00:00 2001
+From: Nectarine <nectarine@localhost>
+Date: Sun, 25 Oct 2026 21:48:35 -0400
+Subject: [PATCH 05/11] win32u: Report D3DMetal hardware scheduling without
+ Vulkan.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adapt CrossOver 24905 inside Proton’s WDDM 2.7 query. Validate the handle and output for the explicit Apple backend, and leave the NVIDIA/Vulkan path unchanged.
+---
+ dlls/win32u/d3dkmt.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
+index 15b172b597d..4a2063ca38c 100644
+--- a/dlls/win32u/d3dkmt.c
++++ b/dlls/win32u/d3dkmt.c
+@@ -723,6 +723,22 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
+         D3DKMT_WDDM_2_7_CAPS *data;
+         const char *e;
+ 
++#if defined(__APPLE__) && defined(__x86_64__)
++        /* CrossOver 24905: D3DMetal submits work without a Vulkan adapter. */
++        e = getenv( "CX_ACTIVE_GRAPHICS_BACKEND" );
++        if (e && !strcmp( e, "d3dmetal" ))
++        {
++            data = desc->pPrivateDriverData;
++            if (desc->PrivateDriverDataSize < sizeof(*data)) return STATUS_INVALID_PARAMETER;
++            if (!get_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER )) return STATUS_INVALID_PARAMETER;
++            memset( data, 0, sizeof(*data) );
++            data->HwSchEnabled = 1;
++            data->HwSchSupported = 1;
++            data->HwSchEnabledByDefault = 1;
++            return STATUS_SUCCESS;
++        }
++#endif
++
+         if (!(adapter = get_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER ))) return STATUS_INVALID_PARAMETER;
+         if (!(physical_device = adapter->physical_device)) return STATUS_INVALID_PARAMETER;
+         instance = physical_device->instance;
+-- 
+2.43.0
+
