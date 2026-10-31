@@ -133,7 +133,7 @@ def collect(a):
         for m in rx.finditer(text):
             findings.append((kind, m.start(), m.group(1).strip()))
     backends = backend_events(a.prefix, a.start)
-    demoted = [b for b in backends if not b.startswith("good")]
+    demoted = [b for b in backends if not b.startswith(("good", "trying"))]   # "trying" = a trial still running
     ips = ips_reports(a.start, a.end, a.exe)
     if not findings and not demoted and not ips:
         return None

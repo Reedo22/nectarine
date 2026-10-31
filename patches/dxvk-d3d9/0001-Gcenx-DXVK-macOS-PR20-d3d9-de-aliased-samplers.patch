@@ -1,0 +1,372 @@
+diff --git a/src/d3d9/d3d9_device.cpp b/src/d3d9/d3d9_device.cpp
+index 23b0a6fd5c7..2b00f20d823 100644
+--- a/src/d3d9/d3d9_device.cpp
++++ b/src/d3d9/d3d9_device.cpp
+@@ -3915,7 +3915,7 @@ namespace dxvk {
+     DxvkDeviceFeatures enabled = {};
+ 
+     // Geometry shaders are used for some meta ops
+-    enabled.core.features.geometryShader = VK_TRUE;
++    enabled.core.features.geometryShader = supported.core.features.geometryShader;
+     enabled.core.features.robustBufferAccess = VK_TRUE;
+     enabled.extRobustness2.robustBufferAccess2 = supported.extRobustness2.robustBufferAccess2;
+ 
+@@ -3944,7 +3944,7 @@ namespace dxvk {
+     enabled.core.features.sampleRateShading = VK_TRUE;
+     enabled.core.features.samplerAnisotropy = supported.core.features.samplerAnisotropy;
+     enabled.core.features.shaderClipDistance = VK_TRUE;
+-    enabled.core.features.shaderCullDistance = VK_TRUE;
++    enabled.core.features.shaderCullDistance = supported.core.features.shaderCullDistance;
+ 
+     // Ensure we support real BC formats and unofficial vendor ones.
+     enabled.core.features.textureCompressionBC = VK_TRUE;
+@@ -5967,11 +5967,13 @@ namespace dxvk {
+ 
+     EmitCs([this,
+       cSlot = slot,
++      cVarCount = m_d3d9Options.deAliasedSamplers ? SamplerVariantCount : 1u,
+       cKey  = key
+     ] (DxvkContext* ctx) {
+       auto pair = m_samplers.find(cKey);
+       if (pair != m_samplers.end()) {
+-        ctx->bindResourceSampler(cSlot, pair->second);
++        for (uint32_t v = 0; v < cVarCount; v++)
++          ctx->bindResourceSampler(cSlot + v, pair->second);
+         return;
+       }
+ 
+@@ -6012,7 +6014,8 @@ namespace dxvk {
+         auto sampler = m_dxvkDevice->createSampler(info);
+ 
+         m_samplers.insert(std::make_pair(cKey, sampler));
+-        ctx->bindResourceSampler(cSlot, std::move(sampler));
++        for (uint32_t v = 0; v < cVarCount; v++)
++          ctx->bindResourceSampler(cSlot + v, sampler);
+ 
+         m_samplerCount++;
+       }
+@@ -6035,18 +6038,34 @@ namespace dxvk {
+     D3D9CommonTexture* commonTex =
+       GetCommonTexture(m_state.textures[StateSampler]);
+ 
++    // De-aliased sampler slots: route the view to the variant slot matching
++    // the texture's type (and depth-compare state); clear the other variants.
++    uint32_t variant = 0u;
++    uint32_t varCount = 1u;
++    if (m_d3d9Options.deAliasedSamplers) {
++      D3DRESOURCETYPE rtype = commonTex->GetType();
++      variant = rtype == D3DRTYPE_VOLUMETEXTURE ? 1u
++              : rtype == D3DRTYPE_CUBETEXTURE   ? 2u : 0u;
++      variant = samplerTypeVariant(variant, commonTex->IsShadow());
++      varCount = SamplerVariantCount;
++    }
++
+     EmitCs([
+       cSlot = slot,
++      cVariant = variant,
++      cVarCount = varCount,
+       cImageView = commonTex->GetSampleView(srgb)
+     ](DxvkContext* ctx) {
+-      ctx->bindResourceView(cSlot, cImageView, nullptr);
++      for (uint32_t v = 0; v < cVarCount; v++)
++        ctx->bindResourceView(cSlot + v, v == cVariant ? cImageView : nullptr, nullptr);
+     });
+   }
+ 
+ 
+   void D3D9DeviceEx::UnbindTextures(uint32_t mask) {
+     EmitCs([
+-      cMask = mask
++      cMask = mask,
++      cVarCount = m_d3d9Options.deAliasedSamplers ? SamplerVariantCount : 1u
+     ](DxvkContext* ctx) {
+       for (uint32_t i : bit::BitMask(cMask)) {
+         auto shaderSampler = RemapStateSamplerShader(i);
+@@ -6054,7 +6073,8 @@ namespace dxvk {
+         uint32_t slot = computeResourceSlotId(shaderSampler.first,
+           DxsoBindingType::Image, uint32_t(shaderSampler.second));
+ 
+-        ctx->bindResourceView(slot, nullptr, nullptr);
++        for (uint32_t v = 0; v < cVarCount; v++)
++          ctx->bindResourceView(slot + v, nullptr, nullptr);
+       }
+     });
+   }
+@@ -7290,12 +7310,14 @@ namespace dxvk {
+       SetStateTexture(i, nullptr);
+ 
+     EmitCs([
+-      cSize = m_state.textures.size()
++      cSize = m_state.textures.size(),
++      cVarCount = m_d3d9Options.deAliasedSamplers ? SamplerVariantCount : 1u
+     ](DxvkContext* ctx) {
+       for (uint32_t i = 0; i < cSize; i++) {
+         auto samplerInfo = RemapStateSamplerShader(DWORD(i));
+         uint32_t slot = computeResourceSlotId(samplerInfo.first, DxsoBindingType::Image, uint32_t(samplerInfo.second));
+-        ctx->bindResourceView(slot, nullptr, nullptr);
++        for (uint32_t v = 0; v < cVarCount; v++)
++          ctx->bindResourceView(slot + v, nullptr, nullptr);
+       }
+     });
+ 
+diff --git a/src/d3d9/d3d9_fixed_function.cpp b/src/d3d9/d3d9_fixed_function.cpp
+index 8ed8062ad5e..eac56ff15fc 100644
+--- a/src/d3d9/d3d9_fixed_function.cpp
++++ b/src/d3d9/d3d9_fixed_function.cpp
+@@ -15,6 +15,7 @@ namespace dxvk {
+ 
+   D3D9FixedFunctionOptions::D3D9FixedFunctionOptions(const D3D9Options* options) {
+     invariantPosition = options->invariantPosition;
++    deAliasedSamplers = options->deAliasedSamplers;
+   }
+ 
+   uint32_t DoFixedFunctionFog(SpirvModule& spvModule, const D3D9FogContext& fogCtx) {
+@@ -2104,8 +2105,16 @@ namespace dxvk {
+       std::string name = str::format("s", i);
+       m_module.setDebugName(sampler.varId, name.c_str());
+ 
++      // De-aliased sampler slots: fixed-function knows its texture type from
++      // the shader key, so bind at that variant's slot (color only; FF does
++      // not sample depth textures).
++      uint32_t ffVariant = 0u;
++      if (m_options.deAliasedSamplers) {
++        ffVariant = type == D3DRTYPE_VOLUMETEXTURE ? 1u
++                  : type == D3DRTYPE_CUBETEXTURE   ? 2u : 0u;
++      }
+       const uint32_t bindingId = computeResourceSlotId(DxsoProgramType::PixelShader,
+-        DxsoBindingType::Image, i);
++        DxsoBindingType::Image, i) + ffVariant;
+ 
+       sampler.bound = m_module.specConstBool(true);
+       m_module.decorateSpecId(sampler.bound, bindingId);
+diff --git a/src/d3d9/d3d9_fixed_function.h b/src/d3d9/d3d9_fixed_function.h
+index 8e312aa2ddf..7cdfcb3d3a1 100644
+--- a/src/d3d9/d3d9_fixed_function.h
++++ b/src/d3d9/d3d9_fixed_function.h
+@@ -40,6 +40,7 @@ namespace dxvk {
+     D3D9FixedFunctionOptions(const D3D9Options* options);
+ 
+     bool invariantPosition;
++    bool deAliasedSamplers;
+   };
+ 
+   // Returns new oFog if VS
+diff --git a/src/d3d9/d3d9_options.cpp b/src/d3d9/d3d9_options.cpp
+index 29d2c60a627..3f000f98d03 100644
+--- a/src/d3d9/d3d9_options.cpp
++++ b/src/d3d9/d3d9_options.cpp
+@@ -62,6 +62,11 @@ namespace dxvk {
+     this->supportVCache                 = config.getOption<bool>        ("d3d9.supportVCache",                 vendorId == 0x10de);
+     this->enableDialogMode              = config.getOption<bool>        ("d3d9.enableDialogMode",              false);
+     this->forceSamplerTypeSpecConstants = config.getOption<bool>        ("d3d9.forceSamplerTypeSpecConstants", false);
++
++    Tristate deAlias = config.getOption<Tristate>("d3d9.deAliasedSamplers", Tristate::Auto);
++    this->deAliasedSamplers = deAlias == Tristate::Auto
++      ? adapter != nullptr && adapter->matchesDriver(DxvkGpuVendor(0x106b) /* Apple */, VK_DRIVER_ID_MOLTENVK, 0, ~0u)
++      : deAlias == Tristate::True;
+     this->forceSwapchainMSAA            = config.getOption<int32_t>     ("d3d9.forceSwapchainMSAA",            -1);
+     this->forceAspectRatio              = config.getOption<std::string> ("d3d9.forceAspectRatio",              "");
+     this->allowDoNotWait                = config.getOption<bool>        ("d3d9.allowDoNotWait",                true);
+diff --git a/src/d3d9/d3d9_options.h b/src/d3d9/d3d9_options.h
+index 17ffb41d7e2..474a3ecf8dc 100644
+--- a/src/d3d9/d3d9_options.h
++++ b/src/d3d9/d3d9_options.h
+@@ -124,6 +124,11 @@ namespace dxvk {
+     /// Works around a game bug in Halo CE where it gives cube textures to 2d/volume samplers
+     bool forceSamplerTypeSpecConstants;
+ 
++    /// De-aliased sampler bindings: one slot per texture-type variant.
++    /// Required on MoltenVK (Metal cannot express aliased bindings);
++    /// Auto enables it exactly there.
++    bool deAliasedSamplers;
++
+     /// Forces an MSAA level on the swapchain
+     int32_t forceSwapchainMSAA;
+ 
+diff --git a/src/dxso/dxso_compiler.cpp b/src/dxso/dxso_compiler.cpp
+index 7cd6f72b683..1f07b9a4955 100644
+--- a/src/dxso/dxso_compiler.cpp
++++ b/src/dxso/dxso_compiler.cpp
+@@ -812,7 +812,26 @@ namespace dxvk {
+ 
+       m_module.decorateDescriptorSet(sampler.varId, 0);
+       m_module.decorateBinding      (sampler.varId, bindingId);
++
++      if (m_moduleInfo.options.deAliasedSamplers) {
++        // De-aliased: this variant owns its slot. Register the resource slot
++        // with the exact view type and a per-slot bound spec constant.
++        uint32_t vBound = m_module.specConstBool(true);
++        m_module.decorateSpecId(vBound, bindingId);
++        m_module.setDebugName(vBound,
++          str::format("s", idx, suffix, depth ? "_shadow" : "", "_bound").c_str());
++        m_variantBoundConsts.push_back(vBound);
++
++        DxvkResourceSlot resource;
++        resource.slot   = bindingId;
++        resource.type   = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++        resource.view   = viewType;
++        resource.access = VK_ACCESS_SHADER_READ_BIT;
++        m_resourceSlots.push_back(resource);
++      }
+     };
++    m_variantBoundConsts.clear();
++    const uint32_t deAliased = m_moduleInfo.options.deAliasedSamplers ? 1u : 0u;
+ 
+     const uint32_t binding = computeResourceSlotId(m_programInfo.type(),
+       DxsoBindingType::Image,
+@@ -824,11 +843,11 @@ namespace dxvk {
+       DxsoSamplerType samplerType = 
+         SamplerTypeFromTextureType(type);
+ 
+-      DclSampler(idx, binding, samplerType, false, implicit);
++      DclSampler(idx, binding + deAliased * samplerTypeVariant(uint32_t(samplerType), false), samplerType, false, implicit);
+ 
+       if (samplerType != SamplerTypeTexture3D) {
+         // We could also be depth compared!
+-        DclSampler(idx, binding, samplerType, true, implicit);
++        DclSampler(idx, binding + deAliased * samplerTypeVariant(uint32_t(samplerType), true), samplerType, true, implicit);
+       }
+     }
+     else {
+@@ -837,27 +856,43 @@ namespace dxvk {
+       for (uint32_t i = 0; i < SamplerTypeCount; i++) {
+         auto samplerType = static_cast<DxsoSamplerType>(i);
+ 
+-        DclSampler(idx, binding, samplerType, false, implicit);
++        DclSampler(idx, binding + deAliased * samplerTypeVariant(uint32_t(samplerType), false), samplerType, false, implicit);
+ 
+         if (samplerType != SamplerTypeTexture3D)
+-          DclSampler(idx, binding, samplerType, true, implicit);
++          DclSampler(idx, binding + deAliased * samplerTypeVariant(uint32_t(samplerType), true), samplerType, true, implicit);
+       }
+     }
+ 
+     DxsoSampler& sampler = m_samplers[idx];
+-    sampler.boundConst = m_module.specConstBool(true);
+     sampler.type = type;
+-    m_module.decorateSpecId(sampler.boundConst, binding);
+-    m_module.setDebugName(sampler.boundConst,
+-      str::format("s", idx, "_bound").c_str());
+ 
+-    // Store descriptor info for the shader interface
+-    DxvkResourceSlot resource;
+-    resource.slot   = binding;
+-    resource.type   = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+-    resource.view   = implicit ? VK_IMAGE_VIEW_TYPE_MAX_ENUM : viewType;
+-    resource.access = VK_ACCESS_SHADER_READ_BIT;
+-    m_resourceSlots.push_back(resource);
++    if (m_moduleInfo.options.deAliasedSamplers) {
++      // De-aliased: the sampler counts as bound if ANY of its variant slots
++      // has a resource bound. Individual slots got their own spec constants
++      // in DclSampler; OR them together here. Resource slots were already
++      // registered per variant inside DclSampler.
++      uint32_t boundConst = 0;
++      uint32_t boolType = m_module.defBoolType();
++      for (uint32_t sc : m_variantBoundConsts) {
++        boundConst = boundConst != 0
++          ? m_module.opLogicalOr(boolType, boundConst, sc)
++          : sc;
++      }
++      sampler.boundConst = boundConst;
++    } else {
++      // Stock behavior: all variants aliased at one slot.
++      sampler.boundConst = m_module.specConstBool(true);
++      m_module.decorateSpecId(sampler.boundConst, binding);
++      m_module.setDebugName(sampler.boundConst,
++        str::format("s", idx, "_bound").c_str());
++
++      DxvkResourceSlot resource;
++      resource.slot   = binding;
++      resource.type   = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
++      resource.view   = implicit ? VK_IMAGE_VIEW_TYPE_MAX_ENUM : viewType;
++      resource.access = VK_ACCESS_SHADER_READ_BIT;
++      m_resourceSlots.push_back(resource);
++    }
+   }
+ 
+ 
+diff --git a/src/dxso/dxso_compiler.h b/src/dxso/dxso_compiler.h
+index f26732f4531..a0815a84426 100644
+--- a/src/dxso/dxso_compiler.h
++++ b/src/dxso/dxso_compiler.h
+@@ -370,6 +370,8 @@ namespace dxvk {
+     //////////////////////////////////////////
+     // Bit masks containing used samplers
+     // and render targets for hazard tracking
++    std::vector<uint32_t> m_variantBoundConsts;
++
+     uint32_t m_usedSamplers;
+     uint32_t m_usedRTs;
+ 
+diff --git a/src/dxso/dxso_options.cpp b/src/dxso/dxso_options.cpp
+index 5e05ee6504a..3db4cb2f092 100644
+--- a/src/dxso/dxso_options.cpp
++++ b/src/dxso/dxso_options.cpp
+@@ -38,6 +38,8 @@ namespace dxvk {
+ 
+     forceSamplerTypeSpecConstants = options.forceSamplerTypeSpecConstants;
+ 
++    deAliasedSamplers = options.deAliasedSamplers;
++
+     vertexFloatConstantBufferAsSSBO = pDevice->GetVertexConstantLayout().floatSize() > devInfo.core.properties.limits.maxUniformBufferRange;
+ 
+     longMad = options.longMad;
+diff --git a/src/dxso/dxso_options.h b/src/dxso/dxso_options.h
+index c977ce8a31f..928f1d06a25 100644
+--- a/src/dxso/dxso_options.h
++++ b/src/dxso/dxso_options.h
+@@ -43,6 +43,8 @@ namespace dxvk {
+     /// Works around a game bug in Halo CE where it gives cube textures to 2d/volume samplers
+     bool forceSamplerTypeSpecConstants;
+ 
++    bool deAliasedSamplers;
++
+     /// Should the SWVP float constant buffer be a SSBO (because of the size on NV)
+     bool vertexFloatConstantBufferAsSSBO;
+ 
+diff --git a/src/dxso/dxso_util.h b/src/dxso/dxso_util.h
+index 3a94acfb1a0..813a4145818 100644
+--- a/src/dxso/dxso_util.h
++++ b/src/dxso/dxso_util.h
+@@ -36,21 +36,38 @@ namespace dxvk {
+     PSCount
+   };
+ 
++  // De-aliased sampler bindings (d3d9.deAliasedSamplers): drivers such as
++  // MoltenVK cannot express multiple differently-typed image variables
++  // aliased at one binding slot, so each d3d9 sampler is given a block of
++  // SamplerVariantCount consecutive slots, one per texture-type variant.
++  // computeResourceSlotId() returns the FIRST slot of the block; add the
++  // variant index for a specific one. The slot layout always reserves the
++  // full block so that both modes share one layout.
++  // Variant order for color matches DxsoSamplerType: 2D=0, 3D=1, Cube=2.
++  constexpr uint32_t SamplerVariantCount     = 5;
++  constexpr uint32_t SamplerVariantDepth2D   = 3;
++  constexpr uint32_t SamplerVariantDepthCube = 4;
++
++  constexpr uint32_t samplerTypeVariant(uint32_t samplerType, bool depth) {
++    return !depth ? samplerType
++      : (samplerType == 2u /* SamplerTypeTextureCube */ ? SamplerVariantDepthCube : SamplerVariantDepth2D);
++  }
++
+   constexpr uint32_t computeResourceSlotId(
+         DxsoProgramType shaderStage,
+         DxsoBindingType bindingType,
+         uint32_t        bindingIndex) {
+-    const uint32_t stageOffset = (DxsoConstantBuffers::VSCount + caps::MaxTexturesVS) * uint32_t(shaderStage);
++    const uint32_t stageOffset = (DxsoConstantBuffers::VSCount + caps::MaxTexturesVS * SamplerVariantCount) * uint32_t(shaderStage);
+ 
+     if (bindingType == DxsoBindingType::ConstantBuffer)
+       return bindingIndex + stageOffset;
+     else // if (bindingType == DxsoBindingType::Image)
+-      return bindingIndex + stageOffset + (shaderStage == DxsoProgramType::PixelShader ? DxsoConstantBuffers::PSCount : DxsoConstantBuffers::VSCount);
++      return bindingIndex * SamplerVariantCount + stageOffset + (shaderStage == DxsoProgramType::PixelShader ? DxsoConstantBuffers::PSCount : DxsoConstantBuffers::VSCount);
+   }
+ 
+   // TODO: Intergrate into compute resource slot ID/refactor all of this?
+   constexpr uint32_t getSWVPBufferSlot() {
+-    return DxsoConstantBuffers::VSCount + caps::MaxTexturesVS + DxsoConstantBuffers::PSCount + caps::MaxTexturesPS + 1; // From last pixel shader slot, above.
++    return DxsoConstantBuffers::VSCount + caps::MaxTexturesVS * SamplerVariantCount + DxsoConstantBuffers::PSCount + caps::MaxTexturesPS * SamplerVariantCount + 1; // From last pixel shader slot, above.
+   }
+ 
+   uint32_t RegisterLinkerSlot(DxsoSemantic semantic);

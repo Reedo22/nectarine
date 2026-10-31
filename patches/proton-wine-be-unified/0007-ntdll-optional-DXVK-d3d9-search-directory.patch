@@ -1,0 +1,51 @@
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 785d58d..4825306 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -142,6 +142,10 @@ BOOL use_macos_pthread_gsbase;
+ static BOOL backend_trial_owner_gone( const char *state );
+ /* Selected backend builtins, searched before the default engine DLL directory. */
+ static char *graphics_dll_dir;
++/* NECTARINE_DXVK9_DIR: DXVK's d3d9.dll (with the MoltenVK de-aliased-sampler fix) for every process,
++ * searched before the builtin wined3d one. Only processes that load d3d9.dll are affected. Per game,
++ * NECTARINE_D3D9=wined3d keeps wined3d. */
++static char *d3d9_dll_dir;
+ #endif
+ 
+ /* die on a fatal error; use only during initialization */
+@@ -322,10 +326,17 @@ static void set_dll_path(void)
+     if (eac_runtime)
+         count += 2;
+ 
+-    dll_paths = malloc( (count + 3) * sizeof(*dll_paths) );
++    {
++        const char *d3d9 = getenv( "NECTARINE_DXVK9_DIR" ), *mode = getenv( "NECTARINE_D3D9" );
++        if (d3d9 && *d3d9 && !(mode && !strcmp( mode, "wined3d" )) && !access( d3d9, R_OK | X_OK ))
++            d3d9_dll_dir = strdup( d3d9 );
++    }
++
++    dll_paths = malloc( (count + 4) * sizeof(*dll_paths) );
+     count = 0;
+ 
+     if (graphics_dll_dir) dll_paths[count++] = graphics_dll_dir;
++    if (d3d9_dll_dir) dll_paths[count++] = d3d9_dll_dir;
+     if (!build_dir) dll_paths[count++] = dll_dir;
+ 
+     if (path)
+@@ -2991,6 +3002,16 @@ static BOOL select_fallback_backend( int argc, char *argv[], const char *image )
+ 
+     unsetenv( "_NECTARINE_BACKEND_STATE" );
+     unsetenv( "_NECTARINE_BACKEND_OWNER" );
++    /* GameMaker games (a data.win next to the exe) issue many small 2D draws; DXVK's D3D9 costs more CPU per
++     * draw than wined3d there (Undertale 30 -> 18-26 fps). Keep them on wined3d unless the user chose. */
++    if (image && !getenv( "NECTARINE_D3D9" ))
++    {
++        const char *slash = strrchr( image, '/' );
++        char gm[4096];
++        if (slash && snprintf( gm, sizeof(gm), "%.*s/data.win", (int)(slash - image), image ) < (int)sizeof(gm) &&
++            !access( gm, F_OK ))
++            setenv( "NECTARINE_D3D9", "wined3d", 1 );
++    }
+     if (!forced && (!automatic || strcmp( automatic, "1" ))) return FALSE;
+     /* Resolve relative Steam launches before applying client exclusions. Games in
+      * steamapps remain eligible; Steam's other executables must never own trials. */

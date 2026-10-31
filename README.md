@@ -30,7 +30,9 @@ Uninstall: `rm -rf ~/Library/Application\ Support/Nectarine ~/Applications/Necta
 
 - **Graphics:** a backend is chosen for each process. D3D10/11/12 games use Apple's D3DMetal,
   with DLSS answered by MetalFX. If a game faults there, its next launch uses DXMT, then DXVK.
-  D3D9 and older use DXVK or wined3d. OpenGL uses Apple's GL. Vulkan uses a patched MoltenVK.
+  **D3D9 games use DXVK** (with Gcenx's de-aliased-sampler fix for MoltenVK). That's 2.8x faster than wined3d in
+  Source games; `NECTARINE_D3D9=wined3d` in `user.env` switches back. GameMaker games (detected by their `data.win`) stay on wined3d, which is faster for them. OpenGL uses Apple's GL. Vulkan uses a
+  patched MoltenVK.
 - **Video cutscenes:** Media Foundation and DirectShow go through bundled GStreamer + FFmpeg
   (LGPL builds), covering H.264, VP8/9, MPEG, WMV/VC-1, AAC, MP3, Vorbis and Opus.
 - **macOS fixes in Wine**, all general rather than per game:

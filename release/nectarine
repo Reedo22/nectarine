@@ -34,6 +34,10 @@ export NECTARINE_D3D12=always NECTARINE_D3DMETAL_DIR="$C/lib/d3dmetal" NECTARINE
 export NECTARINE_DEFAULT_BACKEND=wined3d NECTARINE_BACKEND_AUTO=1
 export CX_APPLEGPTK_LIBD3DSHARED_PATH="$C/lib/external/libd3dshared.dylib"
 export WINEDLLOVERRIDES="d3d10,d3d10_1,d3d10core,d3d11,d3d12,d3d12core,dxgi=b"
+# D3D9: DXVK (with the MoltenVK de-aliased-sampler fix) before wined3d. 2.8x faster in Source games.
+# Set NECTARINE_D3D9=wined3d in user.env (or for one game) to use wined3d instead.
+[ -d "$C/lib/dxvk-d3d9" ] && export NECTARINE_DXVK9_DIR="$C/lib/dxvk-d3d9"
+export MVK_X_FAST_TRANSCENDENTALS=1   # D3D-translation shaders only need HLSL precision (+6..16% on DXVK)
 
 # MoltenVK (DXVK and Vulkan games)
 export VK_ICD_FILENAMES="$C/lib/wine/x86_64-unix/vulkan/icd.d/MoltenVK_icd.json"

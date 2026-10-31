@@ -125,3 +125,26 @@ not available to ordinary processes, but Apple's public Hypervisor.framework let
 
 This is the basis for a planned translator design: native ARM64 Wine and drivers, with x86 game code translated
 and run inside TSO virtual CPUs. Rosetta's general availability ends after macOS 27.
+
+## 9. D3D9: DXVK instead of wined3d (0.1.2)
+
+D3D9 games used to go through wined3d to Apple's OpenGL and were CPU-bound: Portal's menu ran at 42 fps with
+three threads saturated. DXVK 1.10.3's D3D9 rendered black on MoltenVK, because SPIRV-Cross dropped the aliased
+shadow sampler and 63 pixel shaders failed to compile. Gcenx's DXVK-macOS PR #20 (de-aliased sampler bindings),
+backported, fixes it.
+
+| Game (1280×720) | wined3d | DXVK + PR #20 |
+|---|---:|---:|
+| Portal (menu) | 37–42 fps | **115–118 fps** |
+| Half-Life 2 (menu) | CPU-bound | **87 fps** |
+| Sonic Mania | 60 (cap) | 60 (cap) |
+| Undertale | 30.0 | 26.4 (more CPU per draw call; `NECTARINE_D3D9=wined3d` if it matters) |
+
+## 10. Where Satisfactory's GPU time goes (D3DMetal)
+
+Measured with `tools/perf/mtlprof.m`, which interposes the public Metal API and timestamps every pass.
+At 1280×720 a frame has ~123 render passes, ~20 compute passes and ~3,700 draws. About 60% of GPU time is ~63 small
+full-screen passes doing 1–7 draws each: Unreal's per-light shadowing and lighting. The main geometry pass is ~5%.
+Skipping depth/stencil stores on those passes cut attachment traffic by ~18% and changed GPU time by 0. The cost is
+the lighting work itself, not render-pass bandwidth, and D3DMetal's own CPU time is ~2% of a core. For GPU-bound games,
+the lever is rendering fewer pixels (MetalFX / the game's upscaler) and lighter shadow settings.

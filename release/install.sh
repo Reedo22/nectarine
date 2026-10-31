@@ -7,7 +7,7 @@
 #   NECTARINE_ENGINE_TARBALL=/path/to/nectarine-engine-X.tar.xz   install from a local file
 #   NECTARINE_VERSION=0.1.0-alpha                                 pick a release
 set -euo pipefail
-VERSION="${NECTARINE_VERSION:-0.1.1-alpha}"
+VERSION="${NECTARINE_VERSION:-0.1.2-alpha}"
 REPO="Reedo22/nectarine"
 URL="https://github.com/$REPO/releases/download/v$VERSION/nectarine-engine-$VERSION.tar.xz"
 N="${NECTARINE_HOME:-$HOME/Library/Application Support/Nectarine}"
