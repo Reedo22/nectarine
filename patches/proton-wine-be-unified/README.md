@@ -4,5 +4,6 @@
 0003 ntdll: treat a backend trial whose owner is gone/stuck exiting as failed
 0004 ws2_32/ntdll: macOS socket semantics fixes
 0005 server/ntdll: macOS socket hangs (send/recv unconnected, recv into write-watched memory, reconnect after failed connect)
+0006 ntdll: user-mode QueryPerformanceCounter via rdtsc when it matches the syscall clock (-59% syscalls)
 Build note: configure with `-I<repo>/components/inotify` in CPPFLAGS so HAVE_SYS_INOTIFY_H is set and
 wineserver/winebus link the engine's bundled libinotify (kqueue-backed) — file change notifications.

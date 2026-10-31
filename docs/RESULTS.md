@@ -85,3 +85,43 @@ or hung before the codec work. They all pass with the bundled GStreamer + LGPL F
 
 See the compatibility table in the [README](../README.md). A sweep of about 90 games covering most
 engines and APIs is running, and its results will be added here.
+
+## 6. Where the CPU goes (Rosetta + Wine)
+
+Measured with `tools/perf/` (per-thread CPU time joined to `sample` stacks) on the alpha engine:
+
+| Game (scene) | fps | GPU busy | What is busy |
+|---|---:|---:|---|
+| Poly Bridge 2 (D3D11 → D3DMetal, 1280×720) | 130–183 | ~75% | Main thread ~0.7 core, render thread ~0.3. Busy-thread time is mostly Apple framework/driver code (78%) plus D3DMetal (22%). Neither CPU nor GPU is saturated, so the limit is CPU↔GPU hand-off. |
+| Portal (D3D9 → wined3d → OpenGL, menu) | 42 | 25% | Three threads at 70–100%. Busy time: ~65% translated game and Windows code, ~20% Wine's native side, ~14% Apple frameworks. The clearest CPU bottleneck. |
+
+- **Spin loops:** wined3d's command thread, Wine's audio timer and Unity's job workers busy-yield. Each yield
+  is a translated syscall.
+- **Window compositing:** macOS's WindowServer spends ~0.4–0.5 core compositing a windowed game.
+- **DirectSound mixing:** costs ~0.2 core in Portal.
+
+## 7. QueryPerformanceCounter was a syscall (fixed in 0.1.1)
+
+About 70% of all Wine syscalls in Poly Bridge 2 (~90,000/s) were `QueryPerformanceCounter`. Under Rosetta,
+x86's `rdtsc` returns exactly `mach_continuous_time()` in nanoseconds, the clock Wine's syscall reports in
+100 ns units (0 ns difference over 1 M bracketed reads). It costs 10 ns versus ~0.9 µs for a Wine syscall.
+Patch 0006 reads it in user mode, after a self-check that the two clocks agree. Syscalls dropped from 128,000/s
+to 52,000/s. Frame rate was within noise for this game, whose main thread isn't saturated; it saves CPU and power.
+Upstream Wine has the same always-syscall implementation.
+
+## 8. Hardware x86 memory ordering without Rosetta (research)
+
+Rosetta runs translated code with the CPU's TSO (x86-style memory ordering) bit set by the kernel. That bit is
+not available to ordinary processes, but Apple's public Hypervisor.framework lets a virtual CPU set it
+(`HV_SYS_REG_ACTLR_EL1`, macOS 15+). See [research/hv-tso](../research/hv-tso/README.md):
+
+- **It works and is shippable:** ad-hoc signed with the hypervisor entitlement. A message-passing litmus test
+  gives 85–91 M reorderings per 200 M reads with TSO off, and 0 per 400 M with it on.
+- **Hardware TSO costs 0–3%.** Software ordering (acquire/release on every access, a translator's fallback)
+  costs +108–134% on memory-streaming loops.
+- **Exits are affordable:** an exit from the virtual CPU costs 0.92 µs. After the QPC fix, a game makes
+  ~52,000 Windows→native crossings per second, about 0.05 core of exits.
+- **Limit:** 64 virtual CPUs per process.
+
+This is the basis for a planned translator design: native ARM64 Wine and drivers, with x86 game code translated
+and run inside TSO virtual CPUs. Rosetta's general availability ends after macOS 27.

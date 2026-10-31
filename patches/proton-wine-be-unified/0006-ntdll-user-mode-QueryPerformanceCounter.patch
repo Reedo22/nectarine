@@ -1,0 +1,70 @@
+From 160045bcf0085e4693d7d9496cf870dfa0201501 Mon Sep 17 00:00:00 2001
+From: Reedo22 <141674188+Reedo22@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 22:00:10 -0400
+Subject: [PATCH] ntdll: Read QueryPerformanceCounter from rdtsc when it
+ matches the syscall clock.
+
+Under Rosetta, rdtsc returns mach_continuous_time() in nanoseconds, the same clock
+NtQueryPerformanceCounter reports in 100 ns units, at ~10 ns instead of a ~1 us Wine syscall.
+Games call QueryPerformanceCounter tens of thousands of times a second (about 70% of all
+syscalls in Poly Bridge 2). The first call brackets one rdtsc between two syscalls and only
+enables the fast path when they agree, so hosts where the TSC counts cycles keep the syscall.
+
+Measured: Poly Bridge 2 syscalls 128k/s -> 52k/s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/time.c | 35 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/dlls/ntdll/time.c b/dlls/ntdll/time.c
+index 105a6cf5bc8..caba646b59b 100644
+--- a/dlls/ntdll/time.c
++++ b/dlls/ntdll/time.c
+@@ -380,8 +380,43 @@ LONGLONG WINAPI RtlGetSystemTimePrecise( void )
+ /******************************************************************************
+  *  RtlQueryPerformanceCounter   [NTDLL.@]
+  */
++#if defined(__i386__) || defined(__x86_64__)
++static inline ULONGLONG read_tsc(void)
++{
++    unsigned int lo, hi;
++    __asm__ __volatile__( "rdtsc" : "=a" (lo), "=d" (hi) );
++    return ((ULONGLONG)hi << 32) | lo;
++}
++#endif
++
+ BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceCounter( LARGE_INTEGER *counter )
+ {
++#if defined(__i386__) || defined(__x86_64__)
++    /* Under Rosetta, rdtsc is mach_continuous_time() in nanoseconds, the same clock the
++     * NtQueryPerformanceCounter syscall reports in 100 ns units, so the counter can be read without
++     * a syscall (~10 ns instead of ~1 us; games call this tens of thousands of times a second).
++     * Enable that only once a bracketing check shows the two clocks agree; elsewhere (e.g. a TSC
++     * counting CPU cycles) the check fails and the syscall is kept. */
++    static LONG mode;  /* 0 unknown, 1 rdtsc, -1 syscall */
++
++    if (mode > 0)
++    {
++        counter->QuadPart = read_tsc() / 100;
++        return TRUE;
++    }
++    if (!mode)
++    {
++        LARGE_INTEGER before, after;
++        ULONGLONG tsc;
++
++        NtQueryPerformanceCounter( &before, NULL );
++        tsc = read_tsc() / 100;
++        NtQueryPerformanceCounter( &after, NULL );
++        InterlockedCompareExchange( &mode, (tsc >= before.QuadPart && tsc <= after.QuadPart) ? 1 : -1, 0 );
++        counter->QuadPart = after.QuadPart;
++        return TRUE;
++    }
++#endif
+     NtQueryPerformanceCounter( counter, NULL );
+     return TRUE;
+ }
+-- 
+2.43.0
+

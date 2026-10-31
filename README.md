@@ -12,7 +12,7 @@ setting to change.
 
 ## Install
 
-Requirements: Apple Silicon Mac (M1 or later), **macOS 27 or later** (a macOS 26 build is planned),
+Requirements: Apple Silicon Mac (M1 or later), **macOS 26 or later**,
 16 GB RAM recommended, about 8 GB free disk space plus your games.
 
 ```sh
@@ -70,16 +70,22 @@ frame was captured from the game's GPU output. This is a smoke test, not a play-
 | Fallout 3, Fallout: New Vegas | Gamebryo D3D9, 32-bit | Launches (launcher window) |
 | Portal | Source D3D9 | Launches; no frame captured, to be checked |
 
+Sweep, also launched from Steam with two-minute runs: Half-Life: Opposing Force, Half-Life: Blue Shift,
+Half-Life 2: Lost Coast, Half-Life 2: Deathmatch, Half-Life Deathmatch: Source, FAITH: The Unholy Trinity,
+Aviassembly, Stardeus and From the Depths all render. Fallout Tactics launches (launcher window).
+
 Earlier, longer sessions on the same machine: Satisfactory (UE5, D3D11, ~47 fps at medium),
-ULTRAKILL, Dyson Sphere Program, DOOM 64 and GravityMark. A ~90-game sweep across most engines and
-APIs is running, and its results will be added here.
+ULTRAKILL, Dyson Sphere Program, DOOM 64 and GravityMark. The sweep continues, and more results will be added.
+
+**Known broken:** native Vulkan games (for example DOOM 2016, or Source games started with `-vulkan`) stall after
+creating their window. Vulkan through DXVK works. Under investigation.
 
 **Won't work:** games with kernel-level anti-cheat (Easy Anti-Cheat in kernel mode, BattlEye,
 Vanguard, …).
 
 ## Known issues
 
-- **macOS 27 only** for now. The engine is built against the macOS 27 SDK.
+- Tested on macOS 27 only. Since 0.1.1 the engine is built for macOS 26, but no macOS 26 machine has run it yet. Reports welcome.
 - Steam's own interface uses about one CPU core while it is in the foreground. Minimise Steam
   while you play.
 - Settings → Storage → Add Drive in Steam opens a file picker instead of a folder picker.

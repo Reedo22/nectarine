@@ -7,7 +7,7 @@
 #   NECTARINE_ENGINE_TARBALL=/path/to/nectarine-engine-X.tar.xz   install from a local file
 #   NECTARINE_VERSION=0.1.0-alpha                                 pick a release
 set -euo pipefail
-VERSION="${NECTARINE_VERSION:-0.1.0-alpha}"
+VERSION="${NECTARINE_VERSION:-0.1.1-alpha}"
 REPO="Reedo22/nectarine"
 URL="https://github.com/$REPO/releases/download/v$VERSION/nectarine-engine-$VERSION.tar.xz"
 N="${NECTARINE_HOME:-$HOME/Library/Application Support/Nectarine}"
@@ -20,7 +20,7 @@ die()  { printf '\033[31mError: %s\033[0m\n' "$*" >&2; exit 1; }
 say "Checking this Mac"
 [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ] || die "Nectarine needs an Apple Silicon Mac (M1 or later)."
 major=$(sw_vers -productVersion | cut -d. -f1)
-[ "$major" -ge 27 ] || die "This alpha needs macOS 27 or later (you have $(sw_vers -productVersion)). A macOS 26 build is planned."
+[ "$major" -ge 26 ] || die "Nectarine needs macOS 26 or later (you have $(sw_vers -productVersion))."
 if ! /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null; then
   say "Installing Rosetta 2 (Apple asks for an administrator password)"
   /usr/sbin/softwareupdate --install-rosetta --agree-to-license || die "Rosetta 2 is required. Install it with: softwareupdate --install-rosetta"
@@ -106,7 +106,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 <key>CFBundleExecutable</key><string>nectarine-steam</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>VERSION_PLACEHOLDER</string>
-<key>LSMinimumSystemVersion</key><string>27.0</string>
+<key>LSMinimumSystemVersion</key><string>26.0</string>
 </dict></plist>
 EOF
 sed -i '' "s/VERSION_PLACEHOLDER/$VERSION/" "$APP/Contents/Info.plist"
